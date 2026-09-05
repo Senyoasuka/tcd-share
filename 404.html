@@ -12,7 +12,8 @@
     const parts=location.pathname.split('/').filter(Boolean);
     const root=location.hostname.endsWith('.github.io')?`/${parts[0]}`:'';
     const id=parts.at(-1)?.replace(/[^a-zA-Z0-9_-]/g,'')||'';
-    document.getElementById('snapshot').src=`${root}/share.html?id=${id}${location.hash}`;
+    const isStock=parts.includes('s');
+    document.getElementById('snapshot').src=`${root}/${isStock?'stock':'share'}.html?id=${id}${location.hash}`;
   </script>
 </body>
 </html>
