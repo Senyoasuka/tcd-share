@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>持仓与风控快照</title>
+  <style>*{box-sizing:border-box}html,body,iframe{width:100%;height:100%;margin:0;border:0;background:#f6f7f9}</style>
+</head>
+<body>
+  <iframe id="snapshot" title="持仓与风控快照"></iframe>
+  <script>
+    const parts=location.pathname.split('/').filter(Boolean);
+    const root=location.hostname.endsWith('.github.io')?`/${parts[0]}`:'';
+    const id=parts.at(-1)?.replace(/[^a-zA-Z0-9_-]/g,'')||'';
+    document.getElementById('snapshot').src=`${root}/share.html?id=${id}${location.hash}`;
+  </script>
+</body>
+</html>

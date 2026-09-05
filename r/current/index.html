@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="description" content="股票组合持仓与风控只读快照">
+  <title>持仓与风控快照</title>
+  <style>
+    :root{--bg:#f6f7f9;--card:#fff;--line:#e5e7eb;--ink:#1f2937;--dim:#6b7280;--up:#c62828;--down:#2e7d32;--accent:#1565c0;--soft:#f0f6ff}
+    *{box-sizing:border-box}
+    html{background:var(--bg)}
+    body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+    button,a{font:inherit}.wrap{width:min(960px,calc(100% - 32px));margin:0 auto;padding:20px 0 56px}
+    header,section,footer{background:var(--card);border:1px solid var(--line);border-radius:12px}
+    header{padding:20px;margin-bottom:16px}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+    .eyebrow{color:var(--accent);font-size:11px;font-weight:800;letter-spacing:.12em}h1{margin:3px 0 4px;font-size:24px;line-height:1.25}.sub,.muted{color:var(--dim);font-size:12px}
+    .actions{display:flex;gap:8px;flex:0 0 auto}.actions button,.actions a{min-height:36px;padding:0 12px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--accent);font-size:13px;font-weight:700;text-decoration:none;cursor:pointer}.actions .primary{border-color:var(--accent);background:var(--accent);color:#fff}
+    .cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}.card{min-width:0;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:#fafbfc}.card .k{color:var(--dim);font-size:12px}.card .v{margin-top:2px;font-size:21px;font-weight:700;line-height:1.25;font-variant-numeric:tabular-nums}.card .n{margin-top:2px;color:var(--dim);font-size:11px}.card.warn{border-color:#fdba74;background:#fff7ed}.card.ok{border-color:#bbf7d0;background:#f0fdf4}
+    section{padding:18px 20px;margin-bottom:16px}h2{margin:0 0 12px;padding-left:10px;border-left:4px solid var(--accent);font-size:17px}.section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px}.lead{margin-bottom:14px;padding:11px 13px;border-left:3px solid var(--accent);border-radius:0 8px 8px 0;background:var(--soft)}
+    .holdings{display:grid;gap:8px}.holding{display:grid;grid-template-columns:minmax(150px,1.35fr) repeat(3,minmax(80px,.55fr));align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid var(--line)}.holding:last-child{border-bottom:0}.holding>div{min-width:0}.holding strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.holding span,.holding small{display:block;color:var(--dim);font-size:11px}.holding b{font-variant-numeric:tabular-nums}.up{color:var(--up)}.down{color:var(--down)}
+    .chart{width:100%;height:360px;margin-top:4px}.chart-status{display:grid;place-items:center;height:100%;color:var(--dim);font-size:13px}.aside-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}.aside-grid section{margin:0}.note{min-height:126px;padding:12px 14px;border-left:3px solid var(--accent);border-radius:0 8px 8px 0;background:var(--soft);white-space:pre-wrap}.drivers{display:grid;gap:7px}.driver{padding:8px 10px;border:1px solid var(--line);border-radius:8px;color:#4b5563;font-size:13px}.empty{display:grid;place-items:center;min-height:120px;color:var(--dim);text-align:center}.error{max-width:680px;margin:70px auto;padding:26px;color:#7f1d1d}.error a{color:var(--accent)}footer{margin-top:16px;padding:14px 18px;color:var(--dim);font-size:11px}
+    @media(max-width:680px){.wrap{width:calc(100% - 20px);padding:10px 0 36px}.head{flex-direction:column}.actions{display:grid;grid-template-columns:1fr 1fr;width:100%}.actions button,.actions a{display:grid;place-items:center}h1{font-size:20px}.cards{grid-template-columns:1fr 1fr;gap:7px}.card{padding:10px}.card .v{font-size:19px}section{padding:14px 12px}.section-head{align-items:flex-start;flex-direction:column;gap:0}.holding{grid-template-columns:1fr 1fr;gap:7px;padding:10px 6px}.holding>div:first-child{grid-column:1/-1}.chart{height:300px}.aside-grid{grid-template-columns:1fr;gap:12px}.aside-grid section{margin:0}.lead{font-size:13px}}
+  </style>
+</head>
+<body>
+  <main class="wrap" id="app"><div class="empty">正在读取持仓快照...</div></main>
+  <script>
+    const app=document.getElementById('app');
+    const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+    const num=(value,digits=1)=>value==null||Number.isNaN(Number(value))?'—':Number(value).toFixed(digits);
+    const pct=(value,digits=1)=>value==null||Number.isNaN(Number(value))?'—':`${Number(value)>=0?'+':''}${Number(value).toFixed(digits)}%`;
+    const decode=value=>{const normalized=value.replace(/-/g,'+').replace(/_/g,'/');const binary=atob(normalized+'='.repeat((4-normalized.length%4)%4));return JSON.parse(new TextDecoder().decode(Uint8Array.from(binary,char=>char.charCodeAt(0))))};
+    const siteRoot=location.hostname.endsWith('.github.io')?`/${location.pathname.split('/').filter(Boolean)[0]}`:'';
+
+    function snapshotId(){
+      const fromQuery=new URLSearchParams(location.search).get('id');
+      const fromPath=location.pathname.match(/\/r\/([a-zA-Z0-9_-]+)/)?.[1];
+      return String(fromQuery||fromPath||'').replace(/[^a-zA-Z0-9_-]/g,'');
+    }
+
+    async function loadSnapshot(){
+      const encoded=new URLSearchParams(location.hash.replace(/^#/,'')).get('data');
+      if(encoded)return decode(encoded);
+      const id=snapshotId();
+      if(!id)throw new Error('链接中没有可读取的快照');
+      const response=await fetch(`${siteRoot}/static_risk/shares/${id}.json`,{cache:'no-store'});
+      if(!response.ok)throw new Error('这份快照不存在或尚未发布');
+      return response.json();
+    }
+
+    async function loadIndex(snapshot){
+      if(snapshot.index?.dates?.length)return snapshot.index;
+      try{
+        const response=await fetch(`${siteRoot}/static_risk/workspace.json`,{cache:'no-store'});
+        if(!response.ok)return null;
+        return (await response.json()).indices?.[0]||null;
+      }catch(_){return null}
+    }
+
+    let chartLibraryPromise;
+    function loadChartLibrary(){
+      if(window.echarts)return Promise.resolve(window.echarts);
+      if(chartLibraryPromise)return chartLibraryPromise;
+      chartLibraryPromise=new Promise((resolve,reject)=>{
+        const script=document.createElement('script');
+        script.src=`${siteRoot}/echarts.min.js?v=5.5.0`;
+        script.async=true;
+        script.onload=()=>window.echarts?resolve(window.echarts):reject(new Error('图表库未正确加载'));
+        script.onerror=()=>reject(new Error('图表库加载失败'));
+        document.head.appendChild(script);
+      });
+      return chartLibraryPromise;
+    }
+
+    function holdingRow(item){
+      return `<article class="holding"><div><strong>${esc(item.stock_name||item.stock_code)}</strong><span>${esc(item.stock_code)}${item.industry_name?` · ${esc(item.industry_name)}`:''}</span></div><div><small>个股仓位</small><b>${num(item.position_pct,1)}%</b></div><div><small>持仓收益</small><b class="${Number(item.return_pct)>=0?'up':'down'}">${pct(item.return_pct)}</b></div><div><small>风控分</small><b>${num(item.risk_score,1)}</b></div></article>`;
+    }
+
+    async function drawChart(index){
+      const host=document.getElementById('marketChart');
+      if(!host||!index?.dates?.length)return;
+      host.innerHTML='<div class="chart-status">正在加载交互图表...</div>';
+      try{
+        const charts=await loadChartLibrary();
+        host.innerHTML='';
+        const chart=charts.init(host);
+        chart.setOption({animation:false,tooltip:{trigger:'axis',axisPointer:{type:'cross'}},legend:{data:['K线','MA5','MA20'],top:2,right:6,textStyle:{fontSize:10}},grid:[{left:48,right:14,top:36,height:'61%'},{left:48,right:14,top:'78%',height:'10%'}],xAxis:[{type:'category',data:index.dates,boundaryGap:true,axisLabel:{fontSize:9}},{type:'category',gridIndex:1,data:index.dates,axisLabel:{show:false}}],yAxis:[{scale:true,axisLabel:{fontSize:9},splitLine:{lineStyle:{color:'#edf1f5',type:'dashed'}}},{gridIndex:1,axisLabel:{show:false},splitLine:{show:false}}],dataZoom:[{type:'inside',xAxisIndex:[0,1],start:45,end:100},{type:'slider',xAxisIndex:[0,1],start:45,end:100,height:14,bottom:0}],series:[{name:'K线',type:'candlestick',data:index.ohlc||[],itemStyle:{color:'#c62828',color0:'#2e7d32',borderColor:'#c62828',borderColor0:'#2e7d32'}},{name:'MA5',type:'line',data:index.ma5||[],showSymbol:false,lineStyle:{width:1.3,color:'#d97706'}},{name:'MA20',type:'line',data:index.ma20||[],showSymbol:false,lineStyle:{width:1.3,color:'#2563eb'}},{name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,data:index.volumes||[],itemStyle:{color:'#94a3b8'}}]});
+        addEventListener('resize',()=>chart.resize(),{passive:true});
+      }catch(error){host.innerHTML=`<div class="chart-status">${esc(error.message||'图表加载失败')}，请刷新页面</div>`}
+    }
+
+    async function render(snapshot){
+      const holdings=snapshot.position?.holdings||[];
+      const total=Number(snapshot.position?.total_position_pct||0);
+      const risk=Number(snapshot.market?.score);
+      const gap=Number.isFinite(risk)?total-risk:null;
+      const gapText=gap==null?'等待风控分':gap>15?'仓位明显高于风控分':gap>5?'仓位略高于风控分':'仓位与市场环境较匹配';
+      document.title=`${snapshot.portfolio_name||'股票组合'} 持仓与风控快照`;
+      app.innerHTML=`<header><div class="head"><div><div class="eyebrow">PORTFOLIO SNAPSHOT · 只读</div><h1>${esc(snapshot.portfolio_name||'股票组合观察台')}</h1><div class="sub">快照日期 ${esc(snapshot.snapshot_date||'—')}</div></div><div class="actions"><button id="copyLink" class="primary">复制链接</button><a href="${siteRoot}/portfolio_analysis_workbench?tab=risk">返回观察台</a></div></div><div class="cards"><div class="card"><div class="k">大盘风控分</div><div class="v">${num(risk,1)}</div><div class="n">分数越高，市场安全度越高</div></div><div class="card"><div class="k">主理人总仓位</div><div class="v">${num(total,1)}%</div><div class="n">${holdings.length} 只持仓</div></div><div class="card ${gap>5?'warn':'ok'}"><div class="k">仓位 − 风控分</div><div class="v">${gap==null?'—':`${gap>=0?'+':''}${num(gap,1)}`}</div><div class="n">${gapText}</div></div><div class="card"><div class="k">上涨 / 下跌</div><div class="v">${snapshot.market?.breadth_summary?.advancers??'—'} / ${snapshot.market?.breadth_summary?.decliners??'—'}</div><div class="n">当日市场宽度</div></div></div></header><section><div class="section-head"><h2>当前持仓</h2><span class="muted">以分享时数据为准</span></div><div class="lead">总仓位 <b>${num(total,1)}%</b>，大盘风控分 <b>${num(risk,1)}</b>，当前差值 <b>${gap==null?'—':num(gap,1)}</b>。</div><div class="holdings">${holdings.length?holdings.map(holdingRow).join(''):'<div class="empty">该快照没有登记股票持仓</div>'}</div></section><section><div class="section-head"><h2>大盘走势</h2><span class="muted" id="chartLabel">当天静态行情快照</span></div><div id="marketChart" class="chart"><div class="chart-status">正在准备图表...</div></div></section><div class="aside-grid"><section><h2>主理人解释</h2><div class="note">${esc(snapshot.position?.manager_note||'当日暂未填写主理人解释。')}</div></section><section><h2>风控驱动</h2><div class="drivers">${(snapshot.market?.key_drivers||[]).length?(snapshot.market.key_drivers||[]).map(item=>`<div class="driver">${esc(typeof item==='string'?item:(item.explanation||item.name||JSON.stringify(item)))}</div>`).join(''):'<div class="empty">暂无额外驱动说明</div>'}</div></section></div><footer>${esc(snapshot.disclaimer||'本页仅供信息记录与复盘，不构成投资建议。')}</footer>`;
+      document.getElementById('copyLink').onclick=async event=>{try{const url=window.top!==window.self?window.top.location.href:location.href;await navigator.clipboard.writeText(url);event.currentTarget.textContent='已复制'}catch(_){event.currentTarget.textContent='请复制地址栏'}};
+      const index=await loadIndex(snapshot);
+      if(index?.dates?.length){document.getElementById('chartLabel').textContent=`${index.name||'上证指数'} · 静态行情`;drawChart(index)}else document.getElementById('marketChart').innerHTML='<div class="chart-status">暂无指数行情快照</div>';
+    }
+
+    loadSnapshot().then(render).catch(error=>{app.innerHTML=`<section class="error"><h1>无法打开这份快照</h1><p>${esc(error.message||error)}</p><a href="${siteRoot}/portfolio_analysis_workbench">返回股票组合观察台</a></section>`});
+  </script>
+</body>
+</html>
