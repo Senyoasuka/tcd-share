@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>股票组合观察台 · 研究框架</title>
+  <style>
+    :root {
+      --bg: #eef4fb;
+      --panel: rgba(255, 255, 255, 0.84);
+      --text: #0f172a;
+      --muted: #475569;
+      --line: rgba(15, 23, 42, 0.08);
+      --blue: #1d4ed8;
+      --violet: #7c3aed;
+      --red: #d92d20;
+      --green: #039855;
+      --shadow: 0 22px 44px rgba(15, 23, 42, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 0% 0%, rgba(37, 99, 235, 0.12), transparent 24%),
+        radial-gradient(circle at 100% 0%, rgba(124, 58, 237, 0.08), transparent 20%),
+        linear-gradient(180deg, #f2f7fc 0%, #f8fbff 48%, #edf3f9 100%);
+      font-family: "SF Pro Display", "SF Pro SC", "PingFang SC", "Helvetica Neue",
+        "Microsoft YaHei", sans-serif;
+    }
+
+    .shell {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 28px 20px 48px;
+    }
+
+    .glass {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      padding: 28px 30px;
+      background:
+        radial-gradient(circle at 8% 18%, rgba(37, 99, 235, 0.16), transparent 34%),
+        radial-gradient(circle at 88% 16%, rgba(124, 58, 237, 0.12), transparent 26%),
+        linear-gradient(145deg, rgba(255, 255, 255, 0.94), rgba(243, 248, 255, 0.82));
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      padding: 8px 14px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: #1e3a8a;
+      background: rgba(255, 255, 255, 0.9);
+      border: 1px solid rgba(37, 99, 235, 0.14);
+    }
+
+    h1 {
+      margin: 18px 0 0;
+      font-size: 46px;
+      line-height: 1.04;
+      letter-spacing: -0.05em;
+    }
+
+    .lead {
+      margin: 16px 0 0;
+      max-width: 860px;
+      color: #334155;
+      font-size: 16px;
+      line-height: 1.8;
+    }
+
+    .meta {
+      margin-top: 20px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .meta span {
+      padding: 10px 14px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #24324a;
+      background: rgba(255, 255, 255, 0.86);
+      border: 1px solid rgba(37, 99, 235, 0.1);
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+      margin-top: 16px;
+    }
+
+    .grid.two {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .card {
+      padding: 20px;
+      border-radius: 24px;
+      background: rgba(255, 255, 255, 0.8);
+      border: 1px solid var(--line);
+    }
+
+    .card h2,
+    .card h3 {
+      margin: 0 0 12px;
+      letter-spacing: -0.03em;
+    }
+
+    .card h2 {
+      font-size: 26px;
+    }
+
+    .card h3 {
+      font-size: 18px;
+    }
+
+    .card p {
+      margin: 0;
+      color: #334155;
+      line-height: 1.8;
+      font-size: 14px;
+    }
+
+    .process {
+      display: grid;
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 54px minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+      padding: 16px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.76);
+      border: 1px solid var(--line);
+    }
+
+    .step-index {
+      width: 54px;
+      height: 54px;
+      border-radius: 18px;
+      display: grid;
+      place-items: center;
+      font-size: 18px;
+      font-weight: 800;
+      color: #fff;
+      background: linear-gradient(135deg, #1d4ed8, #3b82f6);
+      box-shadow: 0 14px 28px rgba(37, 99, 235, 0.2);
+    }
+
+    .step strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 17px;
+      letter-spacing: -0.03em;
+    }
+
+    .step ul,
+    .card ul {
+      margin: 0;
+      padding-left: 18px;
+      display: grid;
+      gap: 8px;
+      color: #24324a;
+      line-height: 1.72;
+      font-size: 14px;
+    }
+
+    .callout {
+      padding: 18px;
+      border-radius: 22px;
+      background: linear-gradient(180deg, rgba(37, 99, 235, 0.08), rgba(255, 255, 255, 0.86));
+      border: 1px solid rgba(37, 99, 235, 0.12);
+      font-size: 15px;
+      line-height: 1.82;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .pill {
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.84);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .kpi {
+      padding: 18px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.84);
+      border: 1px solid var(--line);
+    }
+
+    .kpi strong,
+    .kpi span {
+      display: block;
+    }
+
+    .kpi strong {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+
+    .kpi span {
+      font-size: 30px;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
+
+    .kpi.red span {
+      color: var(--red);
+    }
+
+    .kpi.green span {
+      color: var(--green);
+    }
+
+    .kpi.blue span {
+      color: var(--blue);
+    }
+
+    .kpi.violet span {
+      color: var(--violet);
+    }
+
+    .footer {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.7;
+    }
+
+    @media (max-width: 960px) {
+      .grid.two,
+      .grid.three {
+        grid-template-columns: 1fr;
+      }
+
+      h1 {
+        font-size: 34px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero glass">
+      <div class="eyebrow">研究框架留档</div>
+      <h1>股票组合观察台的研究框架</h1>
+      <p class="lead">这套系统的目标不是“看一眼交易表就写几句好听的话”，而是把导入的多格式股票组合交易记录，转化为可验证、可比较、可经营的研究结论。所有输出都必须基于客观交易行为、标的特征（如双创板块）和统一行业口径（申万二级），并动态生成适配当前组合的定制化话术与风险提示。</p>
+      <div class="meta">
+        <span>以交易记录为核心证据</span>
+        <span>统一行业口径（申万二级）</span>
+        <span>动态生成定制客群与风险</span>
+        <span>多组合智能对齐与比较</span>
+      </div>
+    </section>
+
+    <section class="grid three">
+      <div class="kpi red">
+        <strong>输入对象</strong>
+        <span>交易记录</span>
+      </div>
+      <div class="kpi blue">
+        <strong>研究目标</strong>
+        <span>看清特征</span>
+      </div>
+      <div class="kpi violet">
+        <strong>最终输出</strong>
+        <span>经营可用</span>
+      </div>
+    </section>
+
+    <section class="grid two">
+      <div class="card">
+        <h2>研究原则</h2>
+        <ul>
+          <li>先还原交易事实，再做逻辑归纳，绝不允许先下结论后找理由。</li>
+          <li>所有行业分析必须采用统一的申万二级行业口径，避免跨组合比较时的维度错乱。</li>
+          <li>拒绝模板化废话，不同组合必须基于实际胜率、盈亏比、行业暴露和持有周期，输出千组千面的差异化话术。</li>
+          <li>严守样本边界，把已平仓交易与未完成头寸严格区分，绝不把缺失信息包装成确定事实。</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>最终回答的问题</h2>
+        <ul>
+          <li>这个组合的真实赚钱逻辑是什么？是拼高胜率、拼盈亏比，还是纯靠特定赛道的贝塔？</li>
+          <li>它是否具备跨行业的普适选股能力，还是只在极少数“行业舒适区”内反复滚动？</li>
+          <li>它存在哪些隐性的防守漏洞？（如：亏损单死扛不卖、频繁的高频滑点损耗等）</li>
+          <li>它究竟适合卖给哪类客户，绝对不能碰哪类客户，理财顾问该如何向客户准确传达？</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>研究流程</h2>
+      <div class="process">
+        <div class="step">
+          <div class="step-index">01</div>
+          <div>
+            <strong>多模态数据标准化</strong>
+            <ul>
+              <li>识别 Excel、CSV、JSON、HTML 等不同来源结构，提取标准字段。</li>
+              <li>对于多次导入的同一个组合，基于交易指纹自动实现去重、合并与增量衔接。</li>
+              <li>确保底层数据库永远是一份结构统一、连续、无重复的纯净样本。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-index">02</div>
+          <div>
+            <strong>交易行为深度还原</strong>
+            <ul>
+              <li>还原持有周期，准确判定组合属于高频快切、中短波段还是低频持有。</li>
+              <li>识别板块偏好，判断是在主板大票还是在“双创及北交板块”高弹性标的间穿梭。</li>
+              <li>判定标的操作模式：是“熟悉标的反复滚动”还是“广覆盖无序轮动”。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-index">03</div>
+          <div>
+            <strong>行业画像与舒适区探测</strong>
+            <ul>
+              <li>调用本地服务补全股票的“申万二级行业”，确保对比的绝对公允。</li>
+              <li>识别第一行业占比及集中度，判定该组合是“依赖单一赛道贝塔”还是“行业配置均衡”。</li>
+              <li>为重复交易次数较多的核心标的，标注其具体行业归属。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-index">04</div>
+          <div>
+            <strong>绩效与防守质量拆解</strong>
+            <ul>
+              <li>不仅看整体胜率和平均收益，更深究其“盈利单平均收益”与“亏损单平均收益”。</li>
+              <li>比对“亏损单平均持有”是否远大于盈利单，侦测“扛单/止损拖沓”的隐性风险。</li>
+              <li>识别单笔最大亏损，判定极端行情下的尾部回撤控制力。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-index">05</div>
+          <div>
+            <strong>多维对比与归纳</strong>
+            <ul>
+              <li>构建横向滚动比较带，将当前组合与对比池中的所有组合进行指标对齐。</li>
+              <li>通过“强弱热力矩阵”，一眼看出谁胜率最高、谁持股最短、谁弹性最足。</li>
+              <li>系统根据数据特征自动输出结构化的一致性评分、优点、关注点与优化建议。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-index">06</div>
+          <div>
+            <strong>定制化对客话术与风控生成</strong>
+            <ul>
+              <li>**千组千面**：如果快切占比高，输出“盯盘积极的活跃型客户”；如果重仓单一行业，提示“需做好赛道认知前置教育”。</li>
+              <li>**动态风险**：根据盈亏比、行业集中度、单笔大亏等特征，自动生成如“止损拖沓风险”、“风格切换逆风期风险”、“单一赛道崩塌风险”的定制化警示。</li>
+              <li>最终让理财顾问可以直接复制专业话术用于客户沟通。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid two">
+      <div class="card">
+        <h2>系统重点观察的维度</h2>
+        <div class="pill-row">
+          <span class="pill">交易节奏</span>
+          <span class="pill">持有周期</span>
+          <span class="pill">标的重复度</span>
+          <span class="pill">板块偏好</span>
+          <span class="pill">行业舒适区</span>
+          <span class="pill">行业依赖度</span>
+          <span class="pill">收益结构</span>
+          <span class="pill">亏损尾部</span>
+          <span class="pill">未完成头寸</span>
+          <span class="pill">对客适配度</span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>系统明确不做的事</h2>
+        <ul>
+          <li>不把交易样本直接包装成完整账户净值结论。</li>
+          <li>不在缺少行业、仓位、最新持仓时强行给确定性判断。</li>
+          <li>不对不同组合输出同一套空泛话术。</li>
+          <li>不把“历史好看”直接等同于“未来一定有效”。</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>一句话概括</h2>
+      <div class="callout">当导入异构交易记录后，系统将进行多模态数据提取、去重与合并，随后基于统一的申万行业标准与双创板块定义，对交易节奏、舒适区、防守纪律进行深度穿透，最终将冷冰冰的数据转化为可跨组比对的高级工作台与动态定制的对客经营话术。</div>
+      <div class="footer">这页的用途是给内部留档，明确系统的研究方法边界，保证后续版本升级时始终围绕“证据驱动、口径统一、千组千面、经营可用”四条主线推进。</div>
+    </section>
+  </div>
+</body>
+</html>
