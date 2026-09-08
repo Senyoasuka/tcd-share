@@ -2647,6 +2647,115 @@ function normalizeOpenPositions(rawPositions) {
     .filter((position) => position.stock);
 }
 
+function buildDailyHoldingOverview(dataset, fallbackOpenPositions = []) {
+  const snapshots = (dataset?.daily_snapshots || dataset?.snapshots || [])
+    .map((snapshot) => ({
+      raw: snapshot,
+      date: getSnapshotDate(snapshot),
+      positions: snapshot?.open_positions || snapshot?.positions || snapshot?.holdings || snapshot?.["持仓"] || [],
+      summary: snapshot?.summary || {},
+    }))
+    .filter((item) => item.date)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const latest = snapshots.at(-1) || null;
+  const latestDate = latest?.date || normalizeDateInput(dataset?.latest_snapshot_date || "");
+  const sourcePositions = latest?.positions?.length ? latest.positions : (dataset?.open_positions || fallbackOpenPositions || []);
+  const positions = sourcePositions.map((raw) => {
+    const stock = sanitizeStockName(raw?.stock || raw?.name || raw?.["证券名称"] || raw?.["公司名称"] || "");
+    const code = extractCode(raw?.code || raw?.["证券代码"] || stock);
+    const returnPct = parsePctPointValue(firstValue(raw, ["return_pct", "unrealized_return_pct", "持有收益率", "收益率"], null));
+    const dayPct = parsePctPointValue(firstValue(raw, ["day_pct_change", "当日涨跌幅", "今日涨跌", "涨跌幅"], null));
+    const buyDate = normalizeDateInput(firstValue(raw, ["buy_date", "买入日期", "调入日期", "date"], ""));
+    let firstSeenDate = "";
+    snapshots.forEach((snapshot) => {
+      const exists = (snapshot.positions || []).some((position) => {
+        const positionStock = sanitizeStockName(position?.stock || position?.name || position?.["证券名称"] || "");
+        const positionCode = extractCode(position?.code || position?.["证券代码"] || positionStock);
+        return code ? positionCode === code : positionStock === stock;
+      });
+      if (exists && !firstSeenDate) firstSeenDate = snapshot.date;
+    });
+    const startDate = buyDate || firstSeenDate;
+    const holdDays = startDate && latestDate ? (diffDays(startDate, latestDate) ?? 0) + 1 : null;
+    return {
+      stock,
+      code,
+      return_pct: returnPct,
+      day_pct_change: dayPct,
+      hold_days: holdDays,
+      weight: parsePctPointValue(firstValue(raw, ["manager_position_pct", "position_pct", "weight", "仓位"], null)),
+      market_value: parseMoneyValue(firstValue(raw, ["market_value", "市值"], null)),
+      pnl: parseMoneyValue(firstValue(raw, ["unrealized_pnl", "pnl", "浮盈亏", "持有收益"], null)),
+    };
+  }).filter((item) => item.stock);
+
+  const returns = positions.map((item) => item.return_pct).filter((value) => value != null);
+  const holdDays = positions.map((item) => item.hold_days).filter((value) => value != null);
+  const validDailyRows = snapshots.map((snapshot) => {
+    const summaryDayPct = parsePctPointValue(firstValue(snapshot.summary, ["dayPct", "day_pct", "daily_return_pct", "当日组合涨跌"], null));
+    const fallbackDayValues = (snapshot.positions || [])
+      .map((position) => parsePctPointValue(firstValue(position, ["day_pct_change", "当日涨跌幅", "今日涨跌", "涨跌幅"], null)))
+      .filter((value) => value != null);
+    return { date: snapshot.date, day_pct: summaryDayPct ?? average(fallbackDayValues) };
+  }).filter((item) => item.day_pct != null);
+  const monthlyMap = new Map();
+  validDailyRows.forEach((row) => {
+    const month = row.date.slice(0, 7);
+    if (!monthlyMap.has(month)) monthlyMap.set(month, []);
+    monthlyMap.get(month).push(row.day_pct);
+  });
+  const monthlyStats = [...monthlyMap.entries()].map(([month, values]) => ({
+    month,
+    count: values.length,
+    avg_return: (values.reduce((nav, value) => nav * (1 + value / 100), 1) - 1) * 100,
+    win_rate: ratio(values.filter((value) => value > 0).length, values.length),
+    metric_label: "盈利日占比",
+  }));
+  const latestSummary = latest?.summary || {};
+  const totalReturnPct = parsePctPointValue(firstValue(latestSummary, ["totalReturnPct", "total_return_pct", "持有总收益率"], null))
+    ?? (() => {
+      const marketValue = parseMoneyValue(firstValue(latestSummary, ["totalMarketValue", "marketTotal", "market_value"], null));
+      const pnl = parseMoneyValue(firstValue(latestSummary, ["pnlTotal", "pnl_total", "浮盈亏"], null));
+      return marketValue != null && pnl != null && marketValue - pnl > 0 ? pnl / (marketValue - pnl) * 100 : null;
+    })();
+  const latestDayPct = parsePctPointValue(firstValue(latestSummary, ["dayPct", "day_pct", "daily_return_pct", "当日组合涨跌"], null))
+    ?? average(positions.map((item) => item.day_pct_change).filter((value) => value != null));
+  const totalPositionPct = sum(positions.map((item) => item.weight).filter((value) => value != null));
+  const currentWinners = positions.filter((item) => item.return_pct != null && item.return_pct > 0).length;
+  const maxWin = returns.length ? Math.max(...returns) : null;
+  const maxLoss = returns.length ? Math.min(...returns) : null;
+  const positiveReturns = returns.filter((value) => value > 0);
+  const negativeReturns = returns.filter((value) => value <= 0);
+  const profitFactor = negativeReturns.length
+    ? sum(positiveReturns) / Math.abs(sum(negativeReturns))
+    : positiveReturns.length ? 3 : null;
+  return {
+    available: Boolean(positions.length && (returns.length || snapshots.length)),
+    source_mode: "daily_holdings",
+    latest_date: latestDate,
+    snapshot_count: snapshots.length,
+    position_count: positions.length,
+    valid_return_count: returns.length,
+    profitable_count: currentWinners,
+    profitable_rate: ratio(currentWinners, returns.length),
+    avg_return: average(returns),
+    median_return: median(returns),
+    avg_hold: average(holdDays),
+    median_hold: median(holdDays),
+    total_return_pct: totalReturnPct,
+    latest_day_pct: latestDayPct,
+    total_position_pct: totalPositionPct || null,
+    avg_daily_return: average(validDailyRows.map((item) => item.day_pct)),
+    positive_day_rate: ratio(validDailyRows.filter((item) => item.day_pct > 0).length, validDailyRows.length),
+    max_win: maxWin,
+    max_loss: maxLoss,
+    profit_factor: profitFactor,
+    unique_stock_count: unique(snapshots.flatMap((snapshot) => (snapshot.positions || []).map((position) => sanitizeStockName(position?.stock || position?.name || position?.["证券名称"] || "")).filter(Boolean))).length,
+    monthlyStats,
+    positions,
+  };
+}
+
 function buildTradeRecord(base, index) {
   const stock = sanitizeStockName(base.stock);
   if (!stock) return null;
@@ -3761,6 +3870,7 @@ function buildAdaptiveNarratives(context) {
 function computeAnalysis(dataset) {
   const trades = normalizeTrades(dataset.trades);
   const openPositions = normalizeOpenPositions(dataset.open_positions);
+  const holdingOverview = buildDailyHoldingOverview(dataset, openPositions);
   const holdingSnapshots = (dataset.daily_snapshots || dataset.snapshots || [])
     .filter((snapshot) => getSnapshotDate(snapshot));
   const latestHoldingSnapshotDate = holdingSnapshots
@@ -4012,6 +4122,7 @@ function computeAnalysis(dataset) {
     industryDistribution,
     industryPerformance,
     monthlyStats,
+    holdingOverview,
     repeatedNames,
     sample_validations: dataset.sample_validations || [],
     styleTags,
@@ -7294,34 +7405,73 @@ function renderRiskCharts(payload) {
 
 function renderOverview(analysis) {
   const suggestionItems = normalizeListItems(analysis.suggestions);
+  const holding = analysis.holdingOverview || {};
+  const useHoldingDetails = analysis.summary.trade_count === 0 && holding.available;
+  const displayMonthlyStats = useHoldingDetails ? holding.monthlyStats : analysis.monthlyStats;
+  const firstMetricValue = useHoldingDetails ? holding.profitable_rate : analysis.summary.win_rate;
+  const secondMetricValue = useHoldingDetails ? holding.avg_return : analysis.summary.avg_return;
+  const thirdMetricValue = useHoldingDetails ? holding.avg_hold : analysis.summary.avg_hold;
+  const firstMetricLabel = useHoldingDetails ? "盈利持仓占比" : "平仓胜率";
+  const secondMetricLabel = useHoldingDetails ? "平均持仓收益" : "平均单笔收益";
+  const fourthMetricLabel = useHoldingDetails ? "当前持仓" : "未完成头寸";
+  const overviewJudgement = useHoldingDetails
+    ? `截至 ${holding.latest_date || "最新持仓日"}，每日持仓明细共记录 ${holding.snapshot_count} 个日期。当前 ${holding.position_count} 只持仓中 ${holding.profitable_count} 只浮盈，盈利持仓占比 ${pct(holding.profitable_rate)}；平均持仓收益 ${pct(holding.avg_return)}，组合持有总收益 ${pct(holding.total_return_pct)}，当日组合涨跌 ${pct(holding.latest_day_pct)}${holding.total_position_pct != null ? `，当前总仓位 ${pct(holding.total_position_pct)}` : ""}。以上为持仓中的未实现收益，不等同于已平仓收益；已平仓交易样本暂未导入。`
+    : analysis.judgement;
+  const displayTradingTraits = useHoldingDetails ? [
+    `每日持仓明细覆盖 ${holding.snapshot_count} 个日期、${holding.unique_stock_count || holding.position_count} 只历史标的；当前持有 ${holding.position_count} 只。`,
+    `最新持仓日组合涨跌 ${pct(holding.latest_day_pct)}，历史持仓日平均涨跌 ${pct(holding.avg_daily_return)}，盈利日占比 ${pct(holding.positive_day_rate)}。`,
+    `当前持仓平均浮动收益 ${pct(holding.avg_return)}，组合持有总收益 ${pct(holding.total_return_pct)}；这些数据会随每日持仓明细更新。`,
+    "当前尚无已平仓闭环交易，因此不计算平仓胜率、已实现单笔收益和利润因子。",
+  ] : analysis.tradingTraits;
+  const displayHoldingTraits = useHoldingDetails ? [
+    `当前 ${holding.position_count} 只持仓，${holding.profitable_count} 只浮盈、${Math.max(0, holding.valid_return_count - holding.profitable_count)} 只浮亏，盈利持仓占比 ${pct(holding.profitable_rate)}。`,
+    `平均持有 ${num(holding.avg_hold)} 天，中位数 ${num(holding.median_hold)} 天；按买入日或首次出现在每日明细的日期计算。`,
+    holding.total_position_pct != null ? `主理人当前总仓位 ${pct(holding.total_position_pct)}，与“交易与持仓”的每日明细保持同一口径。` : "当前持仓比例未完整记录，收益分析按可用的价格与浮盈亏字段计算。",
+    `单只持仓最好浮动收益 ${pct(holding.max_win)}，最弱浮动收益 ${pct(holding.max_loss)}，需继续跟踪在途风险。`,
+  ] : analysis.holdingTraits;
+  const displayStrengths = useHoldingDetails ? [
+    "综合判断已与每日持仓明细打通，当前持仓变化后会同步重算。",
+    `持仓收益、当日涨跌和持有天数均标注数据日期，当前口径截至 ${holding.latest_date || "最新持仓日"}。`,
+    holding.profitable_rate >= 50 ? `当前盈利持仓占比 ${pct(holding.profitable_rate)}，持仓分化可直接识别。` : "当前盈利持仓不足半数，风险状态已在首页直接提示。",
+  ] : analysis.strengths;
+  const displayWeaknesses = useHoldingDetails ? [
+    "当前缺少已平仓交易，不能用在途浮盈浮亏代替真实平仓胜率。",
+    holding.total_return_pct < 0 ? `当前组合持有总收益为 ${pct(holding.total_return_pct)}，仍处于浮亏状态。` : "当前组合持有收益为正，但在卖出前仍可能随行情变化。",
+    "月度图展示的是每日组合收益和盈利日占比，不代表客户实际已实现收益。",
+  ] : analysis.weaknesses;
+  const displaySuggestions = useHoldingDetails ? [
+    "继续每日保存持仓明细，首页会自动累计月度收益与盈利日占比。",
+    "卖出完成后补充成交价和卖出日期，系统将自动切换到已平仓胜率与真实单笔收益口径。",
+    "同时保留总仓位和个股仓位，便于区分收益来自行情还是仓位变化。",
+  ] : suggestionItems;
   document.getElementById("view-overview").innerHTML = `
     <div class="overview-grid">
-      <div class="metric-card up focus">
-        <div class="metric-title">平仓胜率</div>
-        <div class="metric-value">${pct(analysis.summary.win_rate)}</div>
-        <div class="metric-note">${analysis.summary.trade_count} 笔闭环交易样本。</div>
+      <div class="metric-card ${firstMetricValue != null && firstMetricValue >= 50 ? "up" : "down"} focus">
+        <div class="metric-title">${firstMetricLabel}</div>
+        <div class="metric-value">${pct(firstMetricValue)}</div>
+        <div class="metric-note">${useHoldingDetails ? `${holding.profitable_count}/${holding.valid_return_count} 只持仓浮盈 · ${holding.latest_date}` : `${analysis.summary.trade_count} 笔闭环交易样本。`}</div>
       </div>
-      <div class="metric-card blue focus">
-        <div class="metric-title">平均单笔收益</div>
-        <div class="metric-value">${pct(analysis.summary.avg_return)}</div>
-        <div class="metric-note">中位数 ${pct(analysis.summary.median_return)}</div>
+      <div class="metric-card ${secondMetricValue != null && secondMetricValue >= 0 ? "up" : "down"} focus">
+        <div class="metric-title">${secondMetricLabel}</div>
+        <div class="metric-value">${pct(secondMetricValue)}</div>
+        <div class="metric-note">${useHoldingDetails ? `组合总收益 ${pct(holding.total_return_pct)}（未实现）` : `中位数 ${pct(analysis.summary.median_return)}`}</div>
       </div>
       <div class="metric-card amber focus">
         <div class="metric-title">平均持股</div>
-        <div class="metric-value">${num(analysis.summary.avg_hold)}天</div>
-        <div class="metric-note">中位数 ${num(analysis.summary.median_hold)} 天</div>
+        <div class="metric-value">${num(thirdMetricValue)}天</div>
+        <div class="metric-note">中位数 ${num(useHoldingDetails ? holding.median_hold : analysis.summary.median_hold)} 天</div>
       </div>
-      <div class="metric-card ${analysis.summary.max_loss != null && analysis.summary.max_loss < 0 ? "down" : "blue"}">
-        <div class="metric-title">未完成头寸</div>
-        <div class="metric-value">${analysis.summary.open_count}</div>
-        <div class="metric-note">${analysis.profile.holdingState}</div>
+      <div class="metric-card ${useHoldingDetails && holding.total_return_pct < 0 ? "down" : "blue"}">
+        <div class="metric-title">${fourthMetricLabel}</div>
+        <div class="metric-value">${useHoldingDetails ? holding.position_count : analysis.summary.open_count}</div>
+        <div class="metric-note">${useHoldingDetails ? `${holding.total_position_pct != null ? `总仓位 ${pct(holding.total_position_pct)} · ` : ""}每日明细 ${holding.snapshot_count} 天` : analysis.profile.holdingState}</div>
       </div>
     </div>
 
     <div class="panel-grid">
       <div class="panel-card">
         <h3>总评</h3>
-        <div class="insight-callout">${analysis.judgement}</div>
+        <div class="insight-callout">${overviewJudgement}</div>
         <div class="pill-line">
           ${analysis.styleTags.map((item) => `<span class="ghost-pill">${item}</span>`).join("")}
         </div>
@@ -7339,27 +7489,27 @@ function renderOverview(analysis) {
 
     <div class="bento-grid" style="margin-top: 16px;">
       <div class="panel-card bento-col-4">
-        <h3>综合能力雷达图</h3>
+        <h3>${useHoldingDetails ? "当前持仓观察雷达" : "综合能力雷达图"}</h3>
         <div id="radarChart" style="width: 100%; height: 280px; margin-top: 12px;"></div>
       </div>
       <div class="panel-card bento-col-8">
-        <h3>月度收益与胜率趋势</h3>
+        <h3>${useHoldingDetails ? "月度收益与盈利日占比趋势" : "月度收益与胜率趋势"}</h3>
         <div id="monthlyChart" style="width: 100%; height: 280px; margin-top: 12px;"></div>
       </div>
     </div>
 
     <div class="kv-grid" style="margin-top: 16px;">
-      ${renderFoldListCard("交易特征", analysis.tradingTraits, "kv-card", 3)}
-      ${renderFoldListCard("持仓特征", analysis.holdingTraits, "kv-card", 3)}
+      ${renderFoldListCard("交易特征", displayTradingTraits, "kv-card", 3)}
+      ${renderFoldListCard("持仓特征", displayHoldingTraits, "kv-card", 3)}
     </div>
 
     <div class="split-panel">
-      ${renderFoldListCard("优点", analysis.strengths, "list-card", 3)}
-      ${renderFoldListCard("关注点", analysis.weaknesses, "list-card", 3)}
+      ${renderFoldListCard("优点", displayStrengths, "list-card", 3)}
+      ${renderFoldListCard("关注点", displayWeaknesses, "list-card", 3)}
     </div>
     <div class="panel-card" style="margin-top:16px;">
       <h3>优化建议</h3>
-      <ul class="bullet-list">${suggestionItems.map((item) => `<li>${item}</li>`).join("")}</ul>
+      <ul class="bullet-list">${displaySuggestions.map((item) => `<li>${item}</li>`).join("")}</ul>
     </div>
   `;
 
@@ -7373,7 +7523,7 @@ function renderOverview(analysis) {
         tooltip: { trigger: 'item' },
         radar: {
           indicator: [
-            { name: '胜率', max: 100 },
+            { name: useHoldingDetails ? '盈利持仓' : '胜率', max: 100 },
             { name: '盈亏比', max: 3 },
             { name: '单笔爆发', max: 30 },
             { name: '回撤控制', max: 100 },
@@ -7389,14 +7539,14 @@ function renderOverview(analysis) {
           type: 'radar',
           data: [{
             value: [
-              Math.min(100, analysis.summary.win_rate ?? 0),
-              Math.min(3, analysis.summary.profit_factor ?? 1),
-              Math.min(30, analysis.summary.max_win ?? 0),
-              Math.max(0, 100 + (analysis.summary.max_loss ?? -20)),
-              Math.min(100, analysis.summary.within_5d_rate ?? 0),
+              Math.min(100, useHoldingDetails ? (holding.profitable_rate ?? 0) : (analysis.summary.win_rate ?? 0)),
+              Math.min(3, useHoldingDetails ? (holding.profit_factor ?? 1) : (analysis.summary.profit_factor ?? 1)),
+              Math.min(30, Math.max(0, useHoldingDetails ? (holding.max_win ?? 0) : (analysis.summary.max_win ?? 0))),
+              Math.max(0, 100 + (useHoldingDetails ? (holding.max_loss ?? -20) : (analysis.summary.max_loss ?? -20))),
+              Math.min(100, useHoldingDetails ? Math.max(0, 100 - (holding.avg_hold ?? 30) * 3) : (analysis.summary.within_5d_rate ?? 0)),
               Math.min(100, analysis.summary.industry_focus_rate ?? 0)
             ],
-            name: '综合能力',
+            name: useHoldingDetails ? '当前持仓' : '综合能力',
             itemStyle: { color: '#2563eb' },
             areaStyle: { color: 'rgba(37, 99, 235, 0.2)' }
           }]
@@ -7406,29 +7556,30 @@ function renderOverview(analysis) {
 
     // 月度趋势图
     const monthlyDom = document.getElementById("monthlyChart");
-    if (monthlyDom && analysis.monthlyStats && analysis.monthlyStats.length > 0) {
+    if (monthlyDom && displayMonthlyStats && displayMonthlyStats.length > 0) {
       const monthlyChart = echarts.init(monthlyDom);
-      const months = analysis.monthlyStats.map(item => item.month);
-      const returns = analysis.monthlyStats.map(item => Number(item.avg_return?.toFixed(2) || 0));
-      const winRates = analysis.monthlyStats.map(item => Number(item.win_rate?.toFixed(2) || 0));
+      const months = displayMonthlyStats.map(item => item.month);
+      const returns = displayMonthlyStats.map(item => Number(item.avg_return?.toFixed(2) || 0));
+      const winRates = displayMonthlyStats.map(item => Number(item.win_rate?.toFixed(2) || 0));
+      const rateLabel = useHoldingDetails ? '盈利日占比(%)' : '胜率(%)';
 
       monthlyChart.setOption({
         tooltip: {
           trigger: 'axis',
           axisPointer: { type: 'cross' }
         },
-        legend: { data: ['平均收益(%)', '胜率(%)'], bottom: 0 },
+        legend: { data: ['月度收益(%)', rateLabel], bottom: 0 },
         grid: { left: '3%', right: '4%', bottom: '15%', top: '10%', containLabel: true },
         xAxis: [
           { type: 'category', data: months, axisPointer: { type: 'shadow' }, axisLabel: { color: '#64748b' } }
         ],
         yAxis: [
           { type: 'value', name: '收益(%)', axisLabel: { formatter: '{value}' }, splitLine: { lineStyle: { type: 'dashed', color: '#e2e8f0' } } },
-          { type: 'value', name: '胜率(%)', min: 0, max: 100, axisLabel: { formatter: '{value}' }, splitLine: { show: false } }
+          { type: 'value', name: useHoldingDetails ? '盈利日(%)' : '胜率(%)', min: 0, max: 100, axisLabel: { formatter: '{value}' }, splitLine: { show: false } }
         ],
         series: [
           {
-            name: '平均收益(%)',
+            name: '月度收益(%)',
             type: 'bar',
             itemStyle: {
               color: function(params) {
@@ -7439,7 +7590,7 @@ function renderOverview(analysis) {
             data: returns
           },
           {
-            name: '胜率(%)',
+            name: rateLabel,
             type: 'line',
             yAxisIndex: 1,
             smooth: true,
@@ -7450,7 +7601,7 @@ function renderOverview(analysis) {
         ]
       });
     } else if (monthlyDom) {
-      monthlyDom.innerHTML = '<div class="empty-state" style="height: 100%; display: flex; align-items: center; justify-content: center; color: #64748b;">暂无月度数据</div>';
+      monthlyDom.innerHTML = '<div class="empty-state" style="height: 100%; display: flex; align-items: center; justify-content: center; color: #64748b;">每日持仓明细尚无可计算的月度数据</div>';
     }
     
     // 监听窗口大小变化以自动调整图表大小
