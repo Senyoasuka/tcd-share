@@ -750,7 +750,7 @@ function getRecentHotRecords(limit = 30) {
 }
 
 async function postJson(url, payload) {
-  const cloudDeepseekPath = /^\/api\/client-persona\//.test(url);
+  const cloudDeepseekPath = /^\/api\/(?:client-persona\/|holding-assistant\/parse$)/.test(url);
   const requestUrl = cloudDeepseekPath && !isLocalServiceHost()
     ? `https://www.tianchend.online${url}`
     : url;
