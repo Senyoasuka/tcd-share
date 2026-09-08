@@ -32,6 +32,11 @@ const state = {
   selectedMaterialDate: "",
   materialImageResult: null,
   materialSourceSummary: null,
+  materialFrontModal: "",
+  materialFrontLoading: false,
+  materialFrontError: "",
+  materialFrontPortfolioId: "",
+  materialSectorDetails: {},
   advisorReview: null,
   advisorReviewSummary: null,
   clientPersonaScriptsByPortfolio: {},
@@ -74,6 +79,13 @@ const state = {
   holdingAssistantPreview: null,
   holdingAssistantStatus: "",
   holdingAssistantDraft: "",
+  holdingSkillAnalysis: null,
+  holdingSkillAnalysisLoading: false,
+  holdingSkillAnalysisError: "",
+  holdingSkillAnalysisPortfolioId: "",
+  adjustmentReasonDraftByPortfolio: {},
+  adjustmentReasonResultByPortfolio: {},
+  adjustmentReasonStatusByPortfolio: {},
   holdingTradeStatus: "",
   staticSeedGeneratedAt: ""
 };
@@ -247,7 +259,10 @@ function persistState() {
       clientPersonaChatsByPortfolio: state.clientPersonaChatsByPortfolio,
       clientPersonaSelectedByPortfolio: state.clientPersonaSelectedByPortfolio,
       clientPersonaStageByPortfolio: state.clientPersonaStageByPortfolio,
-      clientPersonaOpenDimensionByPortfolio: state.clientPersonaOpenDimensionByPortfolio
+      clientPersonaOpenDimensionByPortfolio: state.clientPersonaOpenDimensionByPortfolio,
+      adjustmentReasonDraftByPortfolio: state.adjustmentReasonDraftByPortfolio,
+      adjustmentReasonResultByPortfolio: state.adjustmentReasonResultByPortfolio,
+      adjustmentReasonStatusByPortfolio: state.adjustmentReasonStatusByPortfolio
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     schedulePortfolioDbSync();
@@ -371,6 +386,9 @@ function hydrateStateFromStorage() {
     state.clientPersonaSelectedByPortfolio = parsed.clientPersonaSelectedByPortfolio || {};
     state.clientPersonaStageByPortfolio = parsed.clientPersonaStageByPortfolio || {};
     state.clientPersonaOpenDimensionByPortfolio = parsed.clientPersonaOpenDimensionByPortfolio || {};
+    state.adjustmentReasonDraftByPortfolio = parsed.adjustmentReasonDraftByPortfolio || {};
+    state.adjustmentReasonResultByPortfolio = parsed.adjustmentReasonResultByPortfolio || {};
+    state.adjustmentReasonStatusByPortfolio = parsed.adjustmentReasonStatusByPortfolio || {};
     const portfolios = (parsed.portfolios || [])
       .map((item) => {
         // 在加载时也应用最新的名称清洗规则，自动净化之前导入的冗长名称
@@ -1734,19 +1752,22 @@ function getCurrentHoldingRows() {
   const current = getCurrentPortfolio();
   const rawPositions = current?.dataset?.open_positions || [];
   const normalized = normalizeOpenPositions(rawPositions);
+  const sourceQuantityUnavailable = current?.dataset?.source_meta?.quantity_available === false;
   return normalized.map((position, index) => {
     const raw = rawPositions[index] || {};
     const quote = getHoldingQuoteByCode(position.code) || {};
-    const quantityIsPlaceholder = Boolean(raw.quantity_is_placeholder);
+    const quantityIsPlaceholder = Boolean(raw.quantity_is_placeholder) || sourceQuantityUnavailable;
     return {
       stock: position.stock,
       code: position.code,
       industry: position.industry_name && position.industry_name !== "未识别" ? position.industry_name : firstValue(raw, ["industry_name", "所属行业", "申万行业"], "未识别"),
       quantity: quantityIsPlaceholder ? "" : firstValue(raw, ["quantity", "qty", "证券数量", "持仓数量", "成交数量"], position.quantity ?? ""),
-      weight: firstValue(raw, ["weight", "仓位"], ""),
+      weight: sourceQuantityUnavailable ? "" : firstValue(raw, ["weight", "仓位"], ""),
       market_value: quantityIsPlaceholder ? "" : firstValue(raw, ["market_value", "市值"], ""),
       latest_price: quote.price ?? firstValue(raw, ["latest_price", "最新价"], ""),
-      cost_price: quantityIsPlaceholder ? "" : firstValue(raw, ["cost_price", "成本价", "buy_price", "买入价"], position.buy_price ?? ""),
+      cost_price: sourceQuantityUnavailable
+        ? firstValue(raw, ["cost_price", "成本价", "buy_price", "买入价"], position.buy_price ?? "")
+        : quantityIsPlaceholder ? "" : firstValue(raw, ["cost_price", "成本价", "buy_price", "买入价"], position.buy_price ?? ""),
       return_pct: quantityIsPlaceholder ? "" : firstValue(raw, ["unrealized_return_pct", "持有收益率", "收益率"], ""),
       day_pct_change: quote.pct_change,
       day_change: quote.change,
@@ -2588,7 +2609,7 @@ function normalizeTrades(rawTrades) {
         idx: parseNumber(trade.idx) ?? index + 1,
         stock,
         code: extractCode(trade.code || trade["证券代码"] || stock),
-        board: inferBoard(stock),
+        board: inferBoard(trade.code || trade["证券代码"] || stock),
         buy_date: buyDate,
         buy_price: buyPrice,
         sell_date: sellDate,
@@ -2613,7 +2634,7 @@ function normalizeOpenPositions(rawPositions) {
         idx: index + 1,
         stock,
         code: extractCode(position.code || position["证券代码"] || stock),
-        board: inferBoard(stock),
+        board: inferBoard(position.code || position["证券代码"] || stock),
         buy_date: normalizeDateInput(position.buy_date || position["买入日期"] || position["最初购买日"] || position["调入时间"]),
         buy_price: parseNumber(position.buy_price || position["买入价"] || position["成交价"]),
         quantity: parseNumber(position.quantity || position.qty || position["成交数量"] || position["持仓数量"]),
@@ -3202,9 +3223,18 @@ async function ensureIndustryServiceReady() {
 }
 
 function getDatasetCodes(dataset) {
+  // 申万二级行业不仅服务当前持仓，也要覆盖历史持仓快照；组合复盘图会读取
+  // 选中日期及上一持仓日的快照，用于展示当日持仓与调仓明细。
+  const snapshotCodes = (dataset.daily_snapshots || dataset.snapshots || [])
+    .flatMap((snapshot) => snapshot.open_positions || snapshot.positions || snapshot.holdings || snapshot["持仓"] || [])
+    .map((item) => typeof item === "string"
+      ? extractCode(item)
+      : extractCode(item?.code || item?.["证券代码"] || item?.stock || item?.name || item?.["证券名称"] || item?.["公司名称"] || ""))
+    .filter(Boolean);
   return unique([
     ...normalizeTrades(dataset.trades).map((item) => item.code).filter(Boolean),
-    ...normalizeOpenPositions(dataset.open_positions).map((item) => item.code).filter(Boolean)
+    ...normalizeOpenPositions(dataset.open_positions).map((item) => item.code).filter(Boolean),
+    ...snapshotCodes
   ]);
 }
 
@@ -8134,6 +8164,58 @@ function portfolioReviewSuggestion(row) {
   return "继续持有";
 }
 
+function isMissingSw2Industry(value) {
+  const text = cleanText(value || "");
+  return !text || ["未识别", "待补全", "未知", "暂无", "-", "--"].includes(text);
+}
+
+function resolvePortfolioReviewIndustry(item) {
+  const code = extractCode(item?.code || item?.stock || item?.name || item?.["证券代码"] || "");
+  const mapped = state.industryCache?.[code] || {};
+  const candidates = [
+    mapped.industry_name,
+    item?.industry_name,
+    item?.industry,
+    item?.["所属行业"],
+    item?.["申万行业"],
+  ];
+  return candidates.map((value) => cleanText(value || "")).find((value) => !isMissingSw2Industry(value)) || "申万二级行业待补全";
+}
+
+async function ensurePortfolioReviewIndustries(targetDate) {
+  // 数据源：选中日期与上一持仓日的持仓快照；接口：GET /api/industry（申万二级）。
+  const timeline = buildHoldingTimelineLookup();
+  const row = timeline.lookup.get(targetDate) || null;
+  const previousRow = timeline.previousByDate.get(targetDate) || null;
+  const positions = [
+    ...(row?.positions || []),
+    ...(previousRow?.positions || []),
+  ];
+  const codes = unique(positions
+    .map((item) => extractCode(item?.code || item?.stock || item?.name || item?.["证券代码"] || ""))
+    .filter(Boolean));
+  const missingCodes = codes.filter((code) => isMissingSw2Industry(state.industryCache?.[code]?.industry_name));
+  if (!missingCodes.length) return;
+
+  const ready = await ensureIndustryServiceReady();
+  if (!ready) throw new Error("申万二级行业服务未启动");
+  const response = await fetch(`/api/industry?codes=${encodeURIComponent(missingCodes.join(","))}`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`申万二级行业查询失败（HTTP ${response.status}）`);
+  const payload = await response.json();
+  Object.assign(state.industryCache, payload.data || {});
+
+  const unresolved = missingCodes.filter((code) => isMissingSw2Industry(state.industryCache?.[code]?.industry_name));
+  if (unresolved.length) throw new Error(`以下证券暂未识别申万二级行业：${unresolved.join("、")}`);
+
+  const current = getCurrentPortfolio();
+  if (current) {
+    current.dataset = applyIndustryMapToDataset(current.dataset, state.industryCache);
+    current.analysis = computeAnalysis(current.dataset);
+    current.meta = buildDatasetMeta(current.dataset, current.name);
+    persistState();
+  }
+}
+
 function buildPortfolioReviewPayload(analysis) {
   const timeline = buildHoldingTimelineLookup();
   const dates = getMaterialDateOptions(analysis);
@@ -8152,7 +8234,7 @@ function buildPortfolioReviewPayload(analysis) {
   const holdings = positions.slice(0, 8).map((item) => ({
     code: item.code || extractCode(item.stock) || "",
     name: sanitizeStockName(item.stock || item.name || ""),
-    industry: item.industry || item.industry_name || "未识别",
+    industry: resolvePortfolioReviewIndustry(item),
     day_change: numberForMaterialPct(item.day_pct_change),
     weight: numberForMaterialPct(item.weight),
     holding_return: numberForMaterialPct(item.return_pct),
@@ -8168,7 +8250,7 @@ function buildPortfolioReviewPayload(analysis) {
   const adjustments = adjustmentRows.slice(0, 5).map(({ item, direction, reason }) => ({
     code: item.code || extractCode(item.stock) || "",
     name: sanitizeStockName(item.stock || item.name || ""),
-    industry: item.industry || item.industry_name || "未识别",
+    industry: resolvePortfolioReviewIndustry(item),
     direction,
     reason,
   }));
@@ -8177,7 +8259,7 @@ function buildPortfolioReviewPayload(analysis) {
     date_label: dateToChineseLabel(selectedDate),
     brand_left: "华泰证券",
     brand_right: "姜洪斌",
-    product_name: "华峰股票精选1号",
+    product_name: "一号计划",
     risk_level: "R4",
     advisor_name: "姜洪斌",
     license_no: "S0570622080052",
@@ -8207,9 +8289,11 @@ function renderMaterialImagePanel(analysis, scripts) {
   const advisorCount = sourceSummary?.advisor_count ?? (state.feedRecords || []).filter((item) => normalizeDateInput(item.date) === selectedDate).length;
   const hotCount = sourceSummary?.hotspot_count ?? (state.hotRecords || []).filter((item) => normalizeDateInput(item.date) === selectedDate).length;
   const advisorUsed = sourceSummary?.advisor_used_date || selectedDate;
-  const hotUsed = sourceSummary?.hotspot_used_date || selectedDate;
-  const fallbackText = sourceSummary && (sourceSummary.advisor_fallback || sourceSummary.hotspot_fallback)
-    ? ` 数据库已回退使用：主理人语料 ${advisorUsed || "无"}，研报热点 ${hotUsed || "无"}。`
+  const fallbackText = sourceSummary?.advisor_fallback
+    ? ` 当日没有早评，已回退使用 ${advisorUsed || "最近日期"} 的金山早评。`
+    : "";
+  const sampleText = sourceSummary?.selected_morning_title
+    ? ` 本次样板：${sourceSummary.selected_morning_title}。`
     : "";
   const image = state.materialImageResult;
   const imageSrc = image?.local_url || image?.image_url || "";
@@ -8218,7 +8302,7 @@ function renderMaterialImagePanel(analysis, scripts) {
       <div class="section-title-row">
         <div>
           <h3>Seedream 图片物料</h3>
-          <p class="lead">按日期读取主理人语料、研报热点和持仓摘要，调用 Doubao-Seedream-5.0-lite 生成早报长图。</p>
+          <p class="lead">按日期从金山云语料中选取一篇早评：资讯长图只讲消息面大事，早评海报只讲指数总看与板块方向。</p>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
           <select class="pill-btn secondary" id="materialDateSelect" style="height:42px;">
@@ -8231,7 +8315,7 @@ function renderMaterialImagePanel(analysis, scripts) {
         </div>
       </div>
       <div class="feed-inline-status" id="materialImageStatus">
-        ${escapeHtml(selectedDate)}：数据库主理人语料 ${advisorCount} 条，研报热点 ${hotCount} 条。${escapeHtml(fallbackText)}
+        ${escapeHtml(selectedDate)}：可用主理人语料 ${advisorCount} 条、研报热点 ${hotCount} 条；本模块只使用所选单篇金山早评。${escapeHtml(fallbackText)}${escapeHtml(sampleText)}
         ${image?.generated_at ? `最近一次生成：${escapeHtml((image.generated_at || "").replace("T", " "))} · ${escapeHtml(image.kind || image.model || "图片物料")}` : "选择日期后点击生成，图片会保存到本地 generated_materials 文件夹。"}
       </div>
       ${imageSrc ? `
@@ -8247,7 +8331,7 @@ function renderMaterialImagePanel(analysis, scripts) {
       ` : `
         <div class="empty-state-card" style="margin-top:14px;">
           <h4>等待生成图片物料</h4>
-          <p>资讯长图和早评海报会用 HTML/CSS 精准排版后截图；正式发送前建议人工检查文字准确性。</p>
+          <p>资讯长图展示消息面因素；早评海报展示指数和板块观点。两者沿用原版式，并按实际文字长度自动收缩。</p>
         </div>
       `}
     </div>
@@ -8273,6 +8357,331 @@ async function refreshMaterialSourceSummary(dateValue) {
   }
 }
 
+/*
+ * 客户只读风控弹窗的数据接口预留：
+ * - /api/v1/risk_dashboard：risk_position_journal、risk_v2.market/factors、
+ *   risk_v2.holdings/sectors、risk_v2.industry_research、position_advice。
+ * - /api/v1/risk/workspace：indices、sectors、instrument_review。
+ * - /api/v1/risk/sector-detail：每个申万二级行业的独立 kline。
+ * - state.feedRecords：系统当日主理人语料；严格按日期和行业/持仓名称匹配。
+ * 页面只做字段排版；通道与压力/支撑使用下方明确的机械规则计算。
+ */
+function materialNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function materialKlineStats(kline = {}) {
+  const ohlc = Array.isArray(kline.ohlc) ? kline.ohlc : [];
+  const closes = ohlc.map((row) => materialNumber(row?.[1])).filter((value) => value != null);
+  const recent = ohlc.slice(-20);
+  const highs = recent.map((row) => materialNumber(row?.[3])).filter((value) => value != null);
+  const lows = recent.map((row) => materialNumber(row?.[2])).filter((value) => value != null);
+  const latestClose = closes.at(-1) ?? materialNumber(kline.latest_close);
+  const latestMa5 = (Array.isArray(kline.ma5) ? kline.ma5 : []).map(materialNumber).filter((value) => value != null).at(-1) ?? null;
+  const latestMa20 = (Array.isArray(kline.ma20) ? kline.ma20 : []).map(materialNumber).filter((value) => value != null).at(-1) ?? null;
+  let channel = "震荡通道";
+  let channelClass = "range";
+  if (latestClose != null && latestMa5 != null && latestMa20 != null && latestClose > latestMa5 && latestMa5 > latestMa20) {
+    channel = "上涨通道";
+    channelClass = "up";
+  } else if (latestClose != null && latestMa5 != null && latestMa20 != null && latestClose < latestMa5 && latestMa5 < latestMa20) {
+    channel = "下跌通道";
+    channelClass = "down";
+  }
+  return {
+    latestClose,
+    pressure: highs.length ? Math.max(...highs) : null,
+    support: lows.length ? Math.min(...lows) : null,
+    latestMa5,
+    latestMa20,
+    channel,
+    channelClass,
+  };
+}
+
+function materialIndustryGroups() {
+  const v2Holdings = state.riskDashboard?.risk_v2?.holdings || [];
+  const sourceRows = v2Holdings.length ? v2Holdings : getCurrentHoldingRows().map((item) => ({
+    entity_id: item.code,
+    name: item.stock,
+    weight: materialNumber(item.weight) || 0,
+    sw_industry: { industry_code: "", industry_name: item.industry || "未识别" },
+  }));
+  const grouped = new Map();
+  sourceRows.forEach((holding) => {
+    const sw = holding.sw_industry || {};
+    const name = cleanText(sw.industry_name || holding.industry || "") || "未识别行业";
+    const code = cleanText(sw.industry_code || "");
+    const key = code || name;
+    const group = grouped.get(key) || { key, code, name, holdings: [], weight: 0 };
+    group.holdings.push(holding);
+    group.weight += materialNumber(holding.weight) || 0;
+    grouped.set(key, group);
+  });
+  return [...grouped.values()];
+}
+
+function materialIndustryCorpusMatches(group, asOfDate) {
+  const industryName = cleanText(group?.name || "");
+  if (!industryName || industryName === "未识别行业") return [];
+  const holdingNames = (group.holdings || []).map((item) => cleanText(item.name || item.stock || "")).filter(Boolean);
+  const matches = [];
+  (state.feedRecords || []).forEach((record) => {
+    const recordDate = normalizeDateInput(record.date || record.doc_date || record.created_at || "");
+    if (recordDate !== asOfDate) return;
+    const exactText = cleanText(record.content || record.raw_text || record.text || record.summary || record.viewpoint || "");
+    const title = cleanText(record.title || record.corpus_type || record.source_type || "当日主理人语料");
+    const searchable = [title, exactText, ...(record.matched_themes || []), ...(record.focus_directions || [])].join(" ");
+    if (searchable.includes(industryName) || holdingNames.some((name) => name && searchable.includes(name))) {
+      matches.push({ title, text: exactText, source: record.source || record.source_type || "系统当日语料包", outlook: "" });
+    }
+  });
+  (state.riskDashboard?.risk_v2?.industry_research || []).forEach((record) => {
+    const publishedDate = normalizeDateInput(record.published_at || record.first_seen_at || "");
+    if (publishedDate !== asOfDate) return;
+    const news = Array.isArray(record.news) ? record.news : [];
+    const searchable = [
+      record.title, record.summary,
+      ...news.flatMap((item) => [item.title, item.subject, item.stock]),
+      ...(record.ai?.affected_industries || []), ...(record.final?.affected_industries || []),
+    ].map((item) => cleanText(item || "")).join(" ");
+    if (!searchable.includes(industryName) && !holdingNames.some((name) => name && searchable.includes(name))) return;
+    const exactOutlook = cleanText(record.manual?.note || record.ai?.opportunity_reason || record.ai?.risk_reason || "");
+    matches.push({
+      title: cleanText(record.title || "当日行业研判"),
+      text: cleanText(record.summary || news[0]?.title || ""),
+      source: cleanText(news[0]?.source || news[0]?.organization || "系统当日语料包"),
+      outlook: exactOutlook,
+    });
+  });
+  const seen = new Set();
+  return matches.filter((item) => {
+    const key = `${item.title}|${item.text}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return Boolean(item.title || item.text);
+  });
+}
+
+function materialPositionDecision(journal, adviceText) {
+  const total = materialNumber(journal?.total_position_pct);
+  const rangeMatch = cleanText(adviceText || "").match(/(\d+(?:\.\d+)?)%\s*[-—~至]\s*(\d+(?:\.\d+)?)%/);
+  if (total == null || !rangeMatch) return { label: "待确认", className: "pending", reason: cleanText(journal?.manager_note || "每日调仓记录未填写调整原因") };
+  const low = Number(rangeMatch[1]);
+  const high = Number(rangeMatch[2]);
+  const required = total < low || total > high;
+  return {
+    label: required ? "是" : "否",
+    className: required ? "yes" : "no",
+    reason: cleanText(journal?.manager_note || adviceText || "每日调仓记录未填写调整原因"),
+  };
+}
+
+function materialRiskFactorList(market, direction) {
+  const rows = (market?.factors || []).filter((item) => item.direction === direction);
+  if (!rows.length) return `<div class="material-trace-placeholder">暂无${direction === "positive" ? "利好" : "利空"}因素记录</div>`;
+  return `<div class="material-trace-factor-list">${rows.map((item) => `<article><header><strong>${escapeHtml(item.factor_name || "未命名因子")}</strong><b>${escapeHtml(item.display_value || "暂无数值")}</b></header><p>${escapeHtml(item.explanation || "暂无推导说明")}</p><small>贡献值 ${item.contribution == null ? "—" : escapeHtml(num(item.contribution, 2))} · 数据源：${escapeHtml(item.data_source || "未标注")}</small></article>`).join("")}</div>`;
+}
+
+function renderMaterialOperationsModal(analysis) {
+  const payload = state.riskDashboard || {};
+  const v2 = payload.risk_v2 || {};
+  const market = v2.market || {};
+  const journal = payload.risk_position_journal || null;
+  const workspace = state.riskWorkspace || {};
+  const instrumentReview = workspace.instrument_review || {};
+  const hedgeEnabled = [instrumentReview.margin_view, instrumentReview.options_view].some((value) => cleanText(value).toLowerCase() === "needed");
+  const hedgeText = cleanText(instrumentReview.note || "") || "今日无对冲操作计划";
+  const positionDecision = materialPositionDecision(journal, payload.position_advice);
+  const indexKline = (workspace.indices || []).find((item) => item.code === "1.000001") || (workspace.indices || [])[0] || {};
+  const indexStats = materialKlineStats(indexKline);
+  const riskSignals = [
+    ...(v2.hard_rules || []).map((item) => cleanText(item.reason || item.label || item.name || "")),
+    ...(market.watch_metrics || []).filter((item) => item.status === "negative").map((item) => `${cleanText(item.name)}：${cleanText(item.value)}${item.alert ? `（${cleanText(item.alert)}）` : ""}`),
+  ].filter(Boolean);
+  const asOfDate = normalizeDateInput(v2.as_of_date || journal?.snapshot_date || state.selectedMaterialDate || formatDateObject(new Date()));
+  const groups = materialIndustryGroups();
+  return `<div class="material-trace-stack">
+    <section class="material-trace-section">
+      <div class="material-trace-section-head"><div><span>模块一</span><h3>每日风控留痕</h3><p>读取每日调仓记录、风控因子结果与衍生品复核记录；业务文本保持原文。</p></div><b>${escapeHtml(asOfDate || "日期待补全")}</b></div>
+      ${journal ? `<div class="material-trace-metrics">
+        <article><span>大盘风控得分</span><strong>${journal.market_risk_score == null ? "—" : escapeHtml(num(journal.market_risk_score, 1))}</strong><small>每日调仓记录.market_risk_score</small></article>
+        <article><span>主理人总仓位</span><strong>${journal.total_position_pct == null ? "—" : `${escapeHtml(num(journal.total_position_pct, 1))}%`}</strong><small>每日调仓记录.total_position_pct</small></article>
+        <article><span>持仓偏差</span><strong>${journal.position_gap == null ? "—" : `${journal.position_gap > 0 ? "+" : ""}${escapeHtml(num(journal.position_gap, 1))}`}</strong><small>每日调仓记录.position_gap</small></article>
+        <article><span>是否需要调整</span><strong class="decision-${positionDecision.className}">${escapeHtml(positionDecision.label)}</strong><small>按建议仓位区间机械校验</small></article>
+      </div>
+      <div class="material-trace-note"><strong>调整原因 / 仓位建议原文</strong><p>${escapeHtml(positionDecision.reason)}</p></div>` : `<div class="material-trace-placeholder">当日每日调仓记录暂无数据</div>`}
+      <div class="material-trace-derivation"><h4>大盘风控得分推导说明</h4><div class="material-trace-factor-grid"><div><div class="factor-title positive">全部利好因素</div>${materialRiskFactorList(market, "positive")}</div><div><div class="factor-title negative">全部利空因素</div>${materialRiskFactorList(market, "negative")}</div></div></div>
+      <div class="material-trace-hedge"><div><span>期权 / 期货对冲配置</span><strong class="hedge-${hedgeEnabled ? "yes" : "no"}">${hedgeEnabled ? "是 · 已启用" : "否 · 未启用"}</strong></div><p>${escapeHtml(hedgeText)}</p><small>数据源：risk_instrument_review.options_view / margin_view / note</small></div>
+    </section>
+
+    <section class="material-trace-section">
+      <div class="material-trace-section-head"><div><span>模块二</span><h3>盘面指数总览</h3><p>指数通道由最新收盘、MA5、MA20机械判定；压力和支撑为最近20个交易日高低点。</p></div><b>${escapeHtml(indexKline.name || "上证指数")}</b></div>
+      <div class="material-index-grid"><div class="material-index-chart"><div class="material-chart-head"><strong>${escapeHtml(indexKline.name || "指数行情")}</strong><span class="channel-${indexStats.channelClass}">${escapeHtml(indexStats.channel)}</span></div><div id="materialMarketIndexChart" class="material-trace-kline"></div></div><div class="material-index-facts"><article><span>最新点位</span><strong>${indexStats.latestClose == null ? "—" : escapeHtml(num(indexStats.latestClose, 2))}</strong></article><article class="pressure"><span>压力位</span><strong>${indexStats.pressure == null ? "—" : escapeHtml(num(indexStats.pressure, 2))}</strong></article><article class="support"><span>支撑位</span><strong>${indexStats.support == null ? "—" : escapeHtml(num(indexStats.support, 2))}</strong></article></div></div>
+      <div class="material-trace-two-col"><div><h4>当前触发的风险信号</h4>${riskSignals.length ? `<ul class="material-risk-signals">${riskSignals.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : `<div class="material-trace-placeholder">当前未记录已触发风险信号</div>`}</div><div><h4>指数综合观点（系统原文）</h4><div class="material-market-view"><p>${escapeHtml(market.change_explanation || "暂无大盘综合观点")}</p>${(market.key_drivers || []).map((item) => `<div><strong>${escapeHtml(item.factor_name || "核心驱动")}</strong><span>${escapeHtml(item.explanation || "暂无说明")}</span></div>`).join("")}</div></div></div>
+    </section>
+
+    <section class="material-trace-section">
+      <div class="material-trace-section-head"><div><span>模块三</span><h3>持仓对应申万二级行业分析</h3><p>按当前持仓的 SW2021 二级行业聚合；当日语料未匹配时不使用历史内容替代。</p></div><b>${groups.length} 个行业</b></div>
+      <div class="material-industry-list">${groups.length ? groups.map((group, index) => renderMaterialIndustryEntry(group, index, asOfDate, v2)).join("") : `<div class="material-trace-placeholder">当前组合暂无可映射持仓行业</div>`}</div>
+    </section>
+  </div>`;
+}
+
+function renderMaterialIndustryEntry(group, index, asOfDate, v2) {
+  const detail = state.materialSectorDetails[group.code] || {};
+  const kline = detail.kline || {};
+  const stats = materialKlineStats(kline);
+  const sectorScore = (v2.sectors || []).find((item) => item.entity_id === group.code || item.name === group.name) || {};
+  const corpus = materialIndustryCorpusMatches(group, asOfDate);
+  const outlook = corpus.map((item) => item.outlook).find(Boolean) || "暂无当日行业后市展望";
+  const holdingsText = (group.holdings || []).map((item) => `${cleanText(item.name || item.stock || item.entity_id)}${item.weight == null ? "" : ` ${num(item.weight, 1)}%`}`).join("、") || "暂无持仓明细";
+  return `<article class="material-industry-card">
+    <header><div><span>${String(index + 1).padStart(2, "0")}</span><div><h4>${escapeHtml(group.name)}</h4><small>${escapeHtml(group.code || "申万二级代码待补全")} · 当前组合 ${group.holdings.length} 只 · 合计仓位 ${escapeHtml(num(group.weight, 1))}%</small></div></div><b class="channel-${stats.channelClass}">${escapeHtml(stats.channel)}</b></header>
+    <div class="material-industry-main"><div><div class="material-chart-head"><strong>${escapeHtml(group.name)} K线</strong><span>${escapeHtml(kline.latest_date || asOfDate || "日期待补全")}</span></div>${(kline.dates || []).length ? `<div id="materialIndustryChart-${index}" data-material-industry-code="${escapeHtml(group.code)}" class="material-trace-kline"></div>` : `<div class="material-trace-placeholder chart">暂无该行业K线数据</div>`}</div><div class="material-index-facts"><article class="pressure"><span>压力位</span><strong>${stats.pressure == null ? "—" : escapeHtml(num(stats.pressure, 2))}</strong></article><article class="support"><span>支撑位</span><strong>${stats.support == null ? "—" : escapeHtml(num(stats.support, 2))}</strong></article><article><span>行业风控分</span><strong>${sectorScore.score == null ? "—" : escapeHtml(num(sectorScore.score, 1))}</strong></article></div></div>
+    <div class="material-industry-text-grid"><section><span>当日行业行情观点</span>${corpus.length ? corpus.map((item) => `<div class="corpus-quote"><strong>${escapeHtml(item.title)}</strong>${item.text ? `<p>${escapeHtml(item.text)}</p>` : ""}<small>${escapeHtml(item.source || "系统当日语料包")}</small></div>`).join("") : `<p class="placeholder-copy">暂无当日行业研判</p>`}</section><section><span>对当前组合的影响说明</span><p>当前组合持仓：${escapeHtml(holdingsText)}</p><p>${escapeHtml(sectorScore.change_explanation || "暂无当日行业影响说明")}</p></section><section><span>行业后市展望</span><p>${escapeHtml(outlook)}</p></section></div>
+  </article>`;
+}
+
+function renderMaterialHoldingsModal() {
+  const holdings = getCurrentHoldingRows();
+  const portfolioId = getCurrentPortfolio()?.id || "__default__";
+  const plan = state.adjustmentReasonResultByPortfolio[portfolioId] || null;
+  return `<div class="material-trace-stack"><section class="material-trace-section"><div class="material-trace-section-head"><div><span>当前组合</span><h3>持仓情况</h3><p>只读展示当前组合持仓，不提供交易或下单入口。</p></div><b>${holdings.length} 只</b></div><div class="material-holdings-table"><table><thead><tr><th>证券</th><th>代码</th><th>申万行业</th><th>仓位</th><th>最新价</th><th>持有收益率</th></tr></thead><tbody>${holdings.length ? holdings.map((item) => `<tr><td><strong>${escapeHtml(item.stock || "—")}</strong></td><td>${escapeHtml(item.code || "—")}</td><td>${escapeHtml(holdingSkillInsight(item.code)?.industry || item.industry || "未识别")}</td><td>${item.weight === "" || item.weight == null ? "—" : `${escapeHtml(num(item.weight, 1))}%`}</td><td>${item.latest_price === "" || item.latest_price == null ? "—" : escapeHtml(num(item.latest_price, 2))}</td><td>${item.return_pct === "" || item.return_pct == null ? "—" : escapeHtml(String(item.return_pct))}</td></tr>`).join("") : `<tr><td colspan="6">当前组合暂无持仓</td></tr>`}</tbody></table></div></section><section class="material-trace-section"><div class="material-trace-section-head"><div><span>华泰技能 · 只读分析</span><h3>持仓压力支撑与交易策略</h3><p>每只持仓展示独立K线、压力支撑、止盈止损、基本交易计划及行业代表性理由。</p></div><b>${escapeHtml(state.holdingSkillAnalysis?.snapshot_date || "同步中")}</b></div>${renderHoldingSkillCards(holdings, "material")}</section><section class="material-trace-section"><div class="material-trace-section-head"><div><span>原调仓留痕</span><h3>最近一次调仓理由与每日计划</h3><p>展示“交易与持仓”页面最近一次生成的调仓理由，作为补充留痕。</p></div></div>${plan ? renderMaterialReadonlyPlan(plan) : `<div class="material-trace-placeholder">暂无已生成的调仓理由；当前持仓的华泰技能交易策略已在上方展示。</div>`}</section></div>`;
+}
+
+function renderMaterialReadonlyPlan(result) {
+  const items = Array.isArray(result.items) ? result.items : [];
+  return `<div class="material-readonly-plan">${items.map((item, index) => `<article><header><span>${index + 1}</span><strong>${escapeHtml(item.stock || "本次调仓")}</strong><b>${escapeHtml(item.action || "调仓")}</b></header><div><span>预计持有</span><p>${escapeHtml(item.expected_holding_days || "待确认")}</p></div><div><span>调仓理由</span><p>${escapeHtml(item.action_reason || "—")}</p></div><div><span>基本面逻辑</span><p>${escapeHtml(item.fundamental_logic || "—")}</p></div><div><span>技术面逻辑</span><p>${escapeHtml(item.technical_logic || "—")}</p></div><div><span>每日交易计划</span>${adjustmentReasonPlanRows(item).map((row) => `<p><strong>${escapeHtml(row.phase)}：</strong>${escapeHtml(row.plan)}</p>`).join("") || `<p>暂无可执行计划</p>`}</div></article>`).join("") || `<div class="material-trace-placeholder">本次结果没有可展示标的</div>`}</div>`;
+}
+
+function renderMaterialFrontModal(analysis) {
+  if (!state.materialFrontModal) return "";
+  const isOperations = state.materialFrontModal === "operations";
+  let content = "";
+  if (isOperations && state.materialFrontLoading) content = `<div class="material-modal-loading"><span></span><strong>正在读取每日调仓记录、风控结果和行业K线…</strong><p>首次加载行情可能需要数秒。</p></div>`;
+  else if (isOperations && state.materialFrontError) content = `<div class="material-modal-error"><strong>数据读取失败</strong><p>${escapeHtml(state.materialFrontError)}</p><button class="pill-btn primary" type="button" data-material-front-retry>重新读取</button></div>`;
+  else content = isOperations ? renderMaterialOperationsModal(analysis) : renderMaterialHoldingsModal();
+  return `<div class="material-front-modal" role="dialog" aria-modal="true" aria-labelledby="materialFrontModalTitle"><div class="material-front-modal-window"><header class="material-front-modal-head"><div><span>股票组合每日展示</span><h2 id="materialFrontModalTitle">${isOperations ? "组合运作基本情况" : "持仓情况及交易计划"}</h2><p>${escapeHtml(analysis.name || "当前组合")} · 客户只读展示</p></div><button type="button" data-material-front-close aria-label="关闭弹窗">×</button></header><div class="material-front-modal-body">${content}</div></div></div>`;
+}
+
+function renderMaterialFrontEntries(analysis) {
+  return `<section class="material-front-entries"><div class="material-front-entries-head"><div><span>客户展示工作台</span><h2>组合每日透明化展示</h2><p>固定在物料生成界面最前端；点击卡片以弹窗查看，全部为只读信息。</p></div><b>${escapeHtml(analysis.summary.latest_snapshot_date || "今日")}</b></div><div class="material-front-entry-grid"><button type="button" class="material-front-entry operations" data-material-front-open="operations"><span>01</span><div><strong>组合运作基本情况</strong><p>每日风控留痕 · 指数压力支撑 · 申万二级行业分析</p></div><b>打开展示 →</b></button><button type="button" class="material-front-entry holdings" data-material-front-open="holdings"><span>02</span><div><strong>持仓情况及交易计划</strong><p>当前持仓 · 最近调仓理由 · 每日交易计划</p></div><b>打开展示 →</b></button></div></section>`;
+}
+
+function syncMaterialFrontPortal(analysis) {
+  document.getElementById("materialFrontPortal")?.remove();
+  if (!state.materialFrontModal) return;
+  const portal = document.createElement("div");
+  portal.id = "materialFrontPortal";
+  portal.innerHTML = renderMaterialFrontModal(analysis);
+  document.body.appendChild(portal);
+}
+
+async function waitForMaterialRiskLoad(timeoutMs = 60000) {
+  const startedAt = Date.now();
+  while (state.riskDashboardLoading || state.riskWorkspaceLoading) {
+    if (Date.now() - startedAt > timeoutMs) throw new Error("风控数据读取超时，请重试");
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+}
+
+async function loadMaterialFrontData(analysis, force = false) {
+  const portfolioId = state.currentPortfolioId || "";
+  state.materialFrontLoading = true;
+  state.materialFrontError = "";
+  if (state.materialFrontPortfolioId !== portfolioId) state.materialSectorDetails = {};
+  renderMaterial(analysis);
+  try {
+    await Promise.all([loadRiskDashboard(force), loadRiskWorkspace(force)]);
+    await waitForMaterialRiskLoad();
+    if (state.riskDashboardError) throw new Error(state.riskDashboardError);
+    if (state.riskWorkspaceError) throw new Error(state.riskWorkspaceError);
+    const codes = materialIndustryGroups().map((item) => item.code).filter(Boolean);
+    const detailRows = await Promise.all(codes.map(async (code) => {
+      if (state.materialSectorDetails[code] && !force) return [code, state.materialSectorDetails[code]];
+      const params = new URLSearchParams({ industry_code: code });
+      if (force) params.set("refresh", "1");
+      const response = await fetch(`/api/v1/risk/sector-detail?${params}`, { cache: "no-store" });
+      const detail = await response.json();
+      if (!response.ok || detail.ok === false) return [code, { ok: false, error: detail.error || `HTTP ${response.status}` }];
+      return [code, detail];
+    }));
+    state.materialSectorDetails = { ...state.materialSectorDetails, ...Object.fromEntries(detailRows) };
+    state.materialFrontPortfolioId = portfolioId;
+  } catch (error) {
+    state.materialFrontError = error.message || String(error);
+  } finally {
+    state.materialFrontLoading = false;
+    if (state.materialFrontModal === "operations" && state.activeTab === "material") renderMaterial(getCurrentAnalysis() || analysis);
+  }
+}
+
+function renderMaterialFrontCharts() {
+  if (typeof echarts === "undefined") return;
+  if (state.materialFrontModal === "holdings") {
+    renderHoldingSkillCharts("material");
+    return;
+  }
+  if (state.materialFrontModal !== "operations") return;
+  const indexKline = (state.riskWorkspace?.indices || []).find((item) => item.code === "1.000001") || (state.riskWorkspace?.indices || [])[0] || {};
+  const rows = [["materialMarketIndexChart", indexKline]];
+  materialIndustryGroups().forEach((group, index) => rows.push([`materialIndustryChart-${index}`, state.materialSectorDetails[group.code]?.kline || {}]));
+  rows.forEach(([id, kline]) => {
+    const dom = document.getElementById(id);
+    if (!dom || !(kline.dates || []).length) return;
+    const stats = materialKlineStats(kline);
+    const annotations = [
+      ...(stats.pressure == null ? [] : [{ type: "pressure", label: "压力位", price: stats.pressure }]),
+      ...(stats.support == null ? [] : [{ type: "pressure", label: "支撑位", price: stats.support }]),
+    ];
+    const chart = echarts.getInstanceByDom(dom) || echarts.init(dom);
+    chart.setOption(riskKlineOption(kline, annotations), true);
+  });
+}
+
+function bindMaterialFrontControls(scope, analysis) {
+  scope.querySelectorAll("[data-material-front-open]").forEach((button) => button.addEventListener("click", () => {
+    const nextModal = button.dataset.materialFrontOpen;
+    const needsOperationsLoad = nextModal === "operations" && (state.materialFrontPortfolioId !== (state.currentPortfolioId || "") || !state.riskDashboard || !state.riskWorkspace);
+    const needsHoldingSkillLoad = nextModal === "holdings" && (!state.holdingSkillAnalysis || state.holdingSkillAnalysisPortfolioId !== (state.currentPortfolioId || ""));
+    state.materialFrontModal = nextModal;
+    if (needsOperationsLoad) state.materialFrontLoading = true;
+    if (needsHoldingSkillLoad) state.holdingSkillAnalysisLoading = true;
+    renderMaterial(analysis);
+    if (needsOperationsLoad) loadMaterialFrontData(analysis);
+    if (needsHoldingSkillLoad) {
+      state.holdingSkillAnalysisLoading = false;
+      loadHoldingSkillAnalysis();
+    }
+  }));
+  scope.querySelectorAll("[data-material-front-close]").forEach((button) => button.addEventListener("click", () => {
+    state.materialFrontModal = "";
+    renderMaterial(analysis);
+  }));
+  const overlay = scope.querySelector(".material-front-modal");
+  if (overlay) overlay.addEventListener("click", (event) => {
+    if (event.target !== overlay) return;
+    state.materialFrontModal = "";
+    renderMaterial(analysis);
+  });
+  scope.querySelectorAll("[data-material-front-retry]").forEach((button) => button.addEventListener("click", () => loadMaterialFrontData(analysis, true)));
+  bindHoldingSkillControls(scope);
+  if (
+    (state.materialFrontModal === "operations" && !state.materialFrontLoading && !state.materialFrontError) ||
+    (state.materialFrontModal === "holdings" && !state.holdingSkillAnalysisLoading && !state.holdingSkillAnalysisError)
+  ) window.setTimeout(renderMaterialFrontCharts, 0);
+  if (!window.__materialFrontEscapeBound) {
+    window.__materialFrontEscapeBound = true;
+    window.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape" || !state.materialFrontModal) return;
+      state.materialFrontModal = "";
+      if (state.activeTab === "material") renderMaterial(getCurrentAnalysis());
+    });
+  }
+}
+
 function renderMaterial(analysis) {
   const container = document.getElementById("view-material");
   if (!container) return;
@@ -8288,6 +8697,7 @@ function renderMaterial(analysis) {
   const combined = scripts.map((item) => `【${item.title}】\n${item.text}`).join("\n\n");
   materialCopyMap.set("all", combined);
   container.innerHTML = `
+    ${renderMaterialFrontEntries(analysis)}
     ${renderMaterialImagePanel(analysis, scripts)}
     <div class="panel-card" style="margin-bottom:14px;">
       <div class="section-title-row">
@@ -8335,8 +8745,10 @@ function renderMaterial(analysis) {
       `).join("")}
     </div>
   `;
+  syncMaterialFrontPortal(analysis);
   bindMaterialCopyControls(container);
   bindMaterialImageControls(container, analysis, scripts);
+  bindMaterialFrontControls(document, analysis);
 }
 
 function bindMaterialCopyControls(scope = document) {
@@ -8376,7 +8788,13 @@ function bindMaterialImageControls(scope, analysis, scripts) {
     try {
       const dates = getMaterialDateOptions(analysis);
       const targetDate = state.selectedMaterialDate || dates[0] || formatDateObject(new Date());
-      const data = kind === "portfolio_review" ? buildPortfolioReviewPayload(analysis) : undefined;
+      if (kind === "portfolio_review") {
+        if (statusEl) statusEl.textContent = "正在识别持仓与调仓明细对应的申万二级行业...";
+        await ensurePortfolioReviewIndustries(targetDate);
+        if (statusEl) statusEl.textContent = "申万二级行业已补全，正在生成组合复盘图...";
+      }
+      const latestAnalysis = getCurrentAnalysis() || analysis;
+      const data = kind === "portfolio_review" ? buildPortfolioReviewPayload(latestAnalysis) : undefined;
       const result = await postJson("/api/material/render-image", {
         kind,
         date: targetDate,
@@ -8456,42 +8874,43 @@ function buildPersonaCoreMetrics(analysis) {
   const dataset = current?.dataset || {};
   const currentHoldingRows = getCurrentHoldingRows();
 
-  // 1. 板块覆盖：优先使用当前持仓的申万行业，并按当前市值计算权重。
+  // 数据源：当前组合持仓 + 申万行业映射缓存。客群匹配与对客话术共用这一份申万二级行业结果。
   const sectorMap = new Map();
+  const resolveHoldingSector = (item) => {
+    const code = extractCode(item.code || item.stock || "");
+    const mappedIndustry = state.industryCache?.[code] || {};
+    return [mappedIndustry.industry_name, item.industry, item.industry_name]
+      .map(cleanText)
+      .find((sector) => sector && !["未识别", "待补全", "未知"].includes(sector)) || "";
+  };
   currentHoldingRows.forEach((item) => {
-    const sector = cleanText(item.industry || item.industry_name || "");
-    if (!sector || ["未识别", "待补全", "未知"].includes(sector)) return;
+    const sector = resolveHoldingSector(item);
+    if (!sector) return;
     const marketValue = parseMoneyValue(item.market_value) || 0;
-    const currentStat = sectorMap.get(sector) || { label: sector, count: 0, marketValue: 0 };
+    const explicitWeight = parseNumber(item.weight);
+    const currentStat = sectorMap.get(sector) || { label: sector, count: 0, marketValue: 0, explicitWeight: 0 };
     currentStat.count += 1;
     currentStat.marketValue += marketValue;
+    currentStat.explicitWeight += explicitWeight || 0;
     sectorMap.set(sector, currentStat);
   });
-  let sectorBasis = "当前持仓 · 申万行业口径";
+  const unmappedHoldingCount = currentHoldingRows.filter((item) => !resolveHoldingSector(item)).length;
+  let sectorBasis = currentHoldingRows.length
+    ? "当前持仓 · 申万二级行业映射库"
+    : "当前暂无持仓，无法识别申万二级行业";
   let sectors = [...sectorMap.values()];
   const totalSectorMarketValue = sectors.reduce((sumValue, item) => sumValue + item.marketValue, 0);
+  const totalExplicitWeight = sectors.reduce((sumValue, item) => sumValue + item.explicitWeight, 0);
   sectors = sectors
     .map((item) => ({
       ...item,
-      weight: totalSectorMarketValue > 0 ? item.marketValue / totalSectorMarketValue * 100 : null,
+      weight: totalSectorMarketValue > 0
+        ? item.marketValue / totalSectorMarketValue * 100
+        : totalExplicitWeight > 0
+          ? item.explicitWeight / totalExplicitWeight * 100
+          : null,
     }))
     .sort((a, b) => (b.marketValue || b.count) - (a.marketValue || a.count));
-  if (!sectors.length) {
-    sectors = (analysis.industryDistribution || []).map((item) => ({
-      label: item.label,
-      count: item.count,
-      weight: item.ratio,
-    }));
-    sectorBasis = "近一年交易样本 · 申万行业口径";
-  }
-  if (!sectors.length) {
-    sectors = (analysis.boardDistribution || []).map((item) => ({
-      label: item.label,
-      count: item.count,
-      weight: item.ratio,
-    }));
-    sectorBasis = "近一年交易样本 · 上市板块口径";
-  }
 
   // 2. 近一年收益：按每日组合涨跌复利，绝不把平均单笔收益当成年收益。
   const snapshots = (dataset.daily_snapshots || dataset.snapshots || [])
@@ -8559,6 +8978,8 @@ function buildPersonaCoreMetrics(analysis) {
   return {
     sectors,
     sectorBasis,
+    holdingCount: currentHoldingRows.length,
+    unmappedHoldingCount,
     trailingReturn,
     returnMethod,
     returnStart,
@@ -8574,10 +8995,50 @@ function buildPersonaCoreMetrics(analysis) {
   };
 }
 
+function buildClientScriptLiveContext(metrics) {
+  // 数据源：系统当日语料库、研报热点语料与当前行情快照；只取原文摘要，不在页面端改写原始语料。
+  const corpusRows = [...(state.feedRecords || []), ...(state.hotRecords || [])]
+    .filter((item) => item && (item.date || item.snapshot_date))
+    .sort((a, b) => String(b.date || b.snapshot_date || "").localeCompare(String(a.date || a.snapshot_date || "")));
+  const latestDate = corpusRows[0]?.date || corpusRows[0]?.snapshot_date || "";
+  const currentRows = latestDate
+    ? corpusRows.filter((item) => (item.date || item.snapshot_date) === latestDate)
+    : corpusRows;
+  const sectorNames = new Set(metrics.sectors.map((item) => item.label));
+  const relatedRows = currentRows.filter((item) => {
+    const text = [item.theme, item.industries, item.market_view, item.core_logic, item.operation_advice, item.risk_warning, item.raw_text]
+      .filter(Boolean)
+      .join(" ");
+    return [...sectorNames].some((sector) => text.includes(sector));
+  });
+  const selectedRows = (relatedRows.length ? relatedRows : currentRows).slice(0, 6);
+  const corpusHighlights = unique(selectedRows.flatMap((item) => [
+    item.market_view,
+    item.core_logic,
+    item.operation_advice,
+    item.risk_warning,
+    item.summary,
+  ]).map(cleanText).filter(Boolean)).slice(0, 4);
+  const marketSnapshot = state.marketSnapshot || {};
+  const marketParts = unique([
+    marketSnapshot.market_view,
+    marketSnapshot.summary,
+    marketSnapshot.index_view,
+    marketSnapshot.risk_warning,
+    ...(Array.isArray(marketSnapshot.risks) ? marketSnapshot.risks.map((item) => item?.text || item?.title || item) : []),
+  ].map(cleanText).filter(Boolean)).slice(0, 3);
+  return {
+    latestDate,
+    corpusHighlights,
+    marketParts,
+    text: [...corpusHighlights, ...marketParts].join("；"),
+  };
+}
+
 function buildAdvisorClientCommunication(analysis, metrics) {
   const topSectors = metrics.sectors.slice(0, 3);
-  const sectorNames = topSectors.map((item) => item.label).join("、") || "当前重点行业";
-  const mainSector = topSectors[0]?.label || "重点行业";
+  const sectorNames = metrics.sectors.map((item) => item.label).join("、") || "申万二级行业映射暂未完成";
+  const mainSector = topSectors[0]?.label || "当前持仓行业";
   const mainSectorWeight = topSectors[0]?.weight;
   const highFrequency = metrics.monthlyFrequency >= 20;
   const mediumFrequency = !highFrequency && metrics.monthlyFrequency >= 8;
@@ -8585,6 +9046,8 @@ function buildAdvisorClientCommunication(analysis, metrics) {
   const returnText = metrics.trailingReturn == null ? "尚无连续净值区间" : pct(metrics.trailingReturn, 2);
   const sampleText = `${metrics.returnStart} 至 ${metrics.returnEnd}，共 ${metrics.returnSampleDays} 个自然日`;
   const frequencyText = `${metrics.frequencyLabel}，后台账本记录 ${metrics.eventCount} 次调仓、${metrics.activeTradingDays} 个活跃交易日，约 ${num(metrics.monthlyFrequency, 1)} 次/月`;
+  const liveContext = buildClientScriptLiveContext(metrics);
+  const holdingNames = getCurrentHoldingRows().map((item) => item.stock).filter(Boolean).join("、") || "当前持仓明细暂未同步";
 
   const customerTags = highFrequency
     ? ["时间充裕型", "短线/做T偏好", "执行及时", "接受高换手"]
@@ -8609,15 +9072,15 @@ function buildAdvisorClientCommunication(analysis, metrics) {
     : mediumFrequency
       ? "主理人以波段和轮动为主，条件升佣便于客户先观察交易节奏，再根据全账户管理需求升级。"
       : "主理人交易节奏偏低，适合用盘后计划和阶段复盘承接忙碌型客户，先观察、再决定是否跟投。";
-  const upgradeRule = "客户资产达到 10 万以上，且明确需要全账户仓位规划、行业轮动、持仓诊断或做T管理时，再评估全账户升佣模式。";
+  const upgradeRule = "只有交易指令实现 2% 及以上收益时才收取千三佣金；如果主理人没有提示减仓或清仓、客户自行卖出持仓，也会触发千三佣金；除此之外的情况均不收取这笔佣金。";
 
   const serviceRights = unique([
-    highFrequency ? "盘中关键位与调仓提醒" : "盘后交易计划与次日思路",
-    highFrequency || mediumFrequency ? "加减仓/做T参考" : "隔夜计划与持有跟踪",
-    `重点板块跟踪：${sectorNames}`,
-    "每日持仓、收益与风险复盘",
-    "热点新闻与研报影响解读",
-    "周度主理人言行一致复盘",
+    "盘面实时应对方案与行情解读",
+    `申万二级行业与个股逻辑拆解：${sectorNames}`,
+    "包含压力位、支撑位的可执行交易计划",
+    "日内做T实操方法",
+    "极端风险下的期权、期货对冲思路",
+    "持仓、调仓与风险复盘",
   ]);
 
   const returnDisclosure = metrics.trailingReturn == null
@@ -8627,38 +9090,46 @@ function buildAdvisorClientCommunication(analysis, metrics) {
       : `当前可验证区间收益为 ${returnText}（${sampleText}），但样本尚${metrics.returnSampleDays >= 365 ? "覆盖一年" : "不足一年"}，不能外推或承诺未来收益。`;
   const concentrationDisclosure = concentrated
     ? `当前第一行业为${mainSector}，市值占比约 ${pct(mainSectorWeight, 1)}，行业景气变化会明显影响组合净值。`
-    : `当前覆盖 ${metrics.sectors.length} 个行业板块，仍需持续观察板块轮动和集中度变化。`;
+    : metrics.sectors.length
+      ? `当前持仓映射出 ${metrics.sectors.length} 个申万二级行业，仍需持续观察板块轮动和集中度变化。`
+      : "当前持仓的申万二级行业映射暂未完成，行业判断将在数据补齐后自动更新。";
+
+  const marketSentence = liveContext.text
+    ? `结合${liveContext.latestDate || "当日"}系统语料，眼下需要重点留意的是：${liveContext.text}。`
+    : "当日行情语料暂未同步，服务端会在语料到位后自动补充盘面判断，不会用历史结论冒充实时观点。";
+  const serviceValueText = `服务不只是告诉您买什么、卖什么。我们会结合盘面实时变化给出应对方案和行情解读，把${sectorNames}这些持仓对应行业拆开讲清楚，也会说明${holdingNames}等个股为什么值得跟踪，帮助您逐步形成自己的选股和研判框架。落到交易上，每次都会尽量把压力位、支撑位和执行条件说清楚，形成可落地的计划；盘中有条件时会讲日内做T的具体方法，遇到极端风险，也会说明怎样借助期权、期货做对冲。这样既能帮助您看懂市场、持续学习，也能把判断落实到交易和风险控制上。`;
+  const commissionText = `收费采用利益绑定的共赢方式：只有交易指令实际跑出 2% 及以上收益时，才收取千三佣金；还有一种情况是主理人没有提示减仓或清仓，但您自行卖出了持仓，也会触发千三佣金。除此之外，其余情况都不收取这笔佣金。这样设计，是希望大家一起面对市场波动，行情弱的时候先尽量控制回撤、少亏钱，机会出现时再一起把握收益。`;
 
   const scripts = [
     {
       id: "first_contact",
-      title: "30秒首次触达",
-      scene: "适合微信私聊或电话开场",
-      text: `您好，我先用三句话把这个组合讲清楚。第一，主理人目前主要围绕${sectorNames}等方向操作；第二，真实交易节奏是${frequencyText}；第三，这不是替您做决定的全权委托，而是提供组合建议、调仓信号和配套研究，最终是否操作由您自己决定。\n\n从风格上看，它更适合${customerTags.slice(0, 4).join("、")}的客户。如果您认可这种节奏，我可以先把当前持仓、近期调仓和服务内容给您看，再判断是否适合。`,
+      title: "自然开场版",
+      scene: "适合微信首次沟通或电话介绍",
+      text: `您好，我先不讲一堆产品术语，直接说说这套服务能为您做什么。当前组合持仓主要落在${sectorNames}，真实交易节奏是${frequencyText}。${marketSentence}\n\n${serviceValueText}\n\n${commissionText}\n\n当然，组合建议不等于收益承诺，最终交易还是由您自主决定。您更想先看当前持仓和交易计划，还是先听我讲讲这些行业现在的机会和风险？`,
     },
     {
       id: "core_fit",
-      title: "核心适配客户深聊版",
-      scene: highFrequency ? "适合时间充裕、短线或做T偏好客户" : "适合与当前交易节奏相匹配的客户",
-      text: `从真实账本看，这位主理人不是泛泛地给股票名单，而是有比较明确的操作边界：板块主要覆盖${sectorNames}，交易节奏属于${metrics.frequencyLabel}，每个活跃交易日平均约 ${num(metrics.operationsPerActiveDay, 1)} 次操作。\n\n如果您平时${highFrequency ? "有时间关注盘面、能及时执行加减仓，并愿意理解科技成长板块的波动" : "更习惯按计划执行、接受波段持有，并愿意定期看组合复盘"}，这套服务更容易和您的习惯匹配。我们会把调仓理由、关键风险和板块变化一起说明，不只是给代码。\n\n${returnDisclosure}所以建议先看真实记录和服务节奏，再决定是否小仓观察或正式跟投。`,
+      title: "服务价值深聊版",
+      scene: "适合客户希望了解具体能得到什么时",
+      text: `如果您想判断这项服务值不值得长期用，可以先看它能不能同时解决“看不懂”和“不会做”两个问题。${marketSentence}\n\n${serviceValueText}\n\n当前组合真实覆盖${sectorNames}，${concentrationDisclosure}${returnDisclosure}这些数据都会如实展示，不会只挑好看的部分讲。\n\n${commissionText}\n\n如果您愿意，我可以接着用一只当前持仓举例，把行业逻辑、关键价位、做T和止损怎么衔接完整讲一遍。`,
     },
     {
       id: "research_client",
-      title: "学习研究型客户版",
-      scene: "适合关注行业逻辑、希望边投边学的客户",
-      text: `如果您不满足于只看买卖信号，而是希望知道为什么调仓，这个组合更值得从研究服务角度看。当前主理人的能力圈主要集中在${sectorNames}，我们会同步相关热点新闻、研报逻辑、行业强弱和持仓变化，并持续验证主理人的观点有没有真正落实到交易上。\n\n您拿到的不只是一次买卖建议，而是一套“行业逻辑—组合持仓—调仓执行—风险复盘”的跟踪链路。${concentrationDisclosure}这类服务更适合愿意理解逻辑、同时能接受行业阶段波动的客户。`,
+      title: "学习成长版",
+      scene: "适合希望边做边学、提升选股能力的客户",
+      text: `如果您不想长期只依赖别人报代码，这套服务更重要的价值，是把判断过程也交给您。${marketSentence}\n\n${serviceValueText}\n\n我们会把系统语料、行业变化、持仓理由和后续验证串起来，您可以慢慢看懂为什么选这些方向、什么情况下继续持有、什么情况下需要收缩风险。${returnDisclosure}\n\n${commissionText}\n\n您可以先告诉我，您现在最想提升的是看盘、选股，还是交易执行，我会从当前组合里挑最合适的例子和您讲。`,
     },
     {
       id: "mode_and_rights",
-      title: "收费模式与服务权益说明",
-      scene: "适合客户询问怎么收费、能得到什么服务时",
-      text: `结合这位主理人的风格，当前建议优先评估“${primaryMode}”。原因是：${modeReason}\n\n可配置的核心服务包括：${serviceRights.join("、")}。${upgradeRule}\n\n需要说明的是，两种模式都属于投顾建议服务，不是全权委托；交易由您自主决定。具体佣金标准、盈利触发条件、服务边界和退出方式，以您最终签署的正式协议为准，我们不会用口头表述替代合同。`,
+      title: "服务与收费说明版",
+      scene: "适合客户直接询问服务内容和收费规则时",
+      text: `可以，我把服务和收费一次说清楚。${marketSentence}\n\n${serviceValueText}\n\n${commissionText}\n\n这属于投顾建议服务，不是替您操作账户，也不承诺收益；最终是否执行由您自己决定，正式服务边界以协议为准。您如果方便，我再把当前持仓对应的行业、压力支撑和下一步交易计划发给您看，内容会更直观。`,
     },
     {
       id: "risk_close",
       title: "风险提示与合规收尾",
       scene: "适合客户准备签约或要求收益承诺时",
-      text: `签约前我把不适配的地方也说清楚。${returnDisclosure}${concentrationDisclosure}${highFrequency ? "另外，组合换手较快，如果您无法及时查看并自主执行指令，实际体验可能与组合记录存在明显偏差。" : "另外，组合需要按计划持有，如果频繁追涨杀跌，也可能偏离主理人的原始节奏。"}\n\n因此，这个组合不适合${avoidTags.join("、")}的客户。过往表现不代表未来收益，任何收费和服务都以正式协议为准。建议您先核对自己的资金期限、风险承受力和执行时间，确认匹配后再开通。`,
+      text: `在您决定之前，我也把边界讲清楚。${returnDisclosure}${concentrationDisclosure}${highFrequency ? "组合换手较快，如果不能及时查看并自主执行提醒，实际体验可能与组合记录有差异。" : "组合需要按计划持有，如果频繁追涨杀跌，也可能偏离原来的节奏。"}\n\n${serviceValueText}\n\n${commissionText}\n\n过往表现不代表未来收益，这项服务提供的是研究、计划和风险应对，不是保本承诺。您可以先核对资金期限、风险承受能力和执行时间，再决定是否匹配。`,
     },
   ];
 
@@ -8669,22 +9140,27 @@ function buildAdvisorClientCommunication(analysis, metrics) {
     modeReason,
     upgradeRule,
     serviceRights,
+    liveContext,
     scripts,
   };
 }
 
 function buildClientPersonaApiPayload(analysis, metrics, communication) {
   const portfolio = getCurrentPortfolio();
+  // 数据源：当前持仓、申万二级行业聚合、系统当日语料与行情快照，一次性传给话术生成接口。
   return {
+    schema_version: "client_persona_v2",
     portfolio_id: portfolio?.id || analysis.name,
     portfolio_name: analysis.name,
     portfolio_facts: {
-      sectors: metrics.sectors.slice(0, 10).map((item) => ({
+      sectors: metrics.sectors.map((item) => ({
         name: item.label,
         weight: item.weight,
         stock_count: item.count || 0,
       })),
       sector_basis: metrics.sectorBasis,
+      holding_count: metrics.holdingCount,
+      unmapped_holding_count: metrics.unmappedHoldingCount,
       trailing_return: metrics.trailingReturn,
       trailing_return_text: metrics.trailingReturn == null ? "暂无足够连续净值" : pct(metrics.trailingReturn, 2),
       return_period: `${metrics.returnStart} 至 ${metrics.returnEnd}`,
@@ -8699,6 +9175,7 @@ function buildClientPersonaApiPayload(analysis, metrics, communication) {
       avoid_tags: communication.avoidTags,
       primary_mode: communication.primaryMode,
       service_rights: communication.serviceRights,
+      conditional_commission_rule: communication.upgradeRule,
       style_tags: analysis.styleTags || [],
       current_holdings: (analysis.openPositions || []).slice(0, 20).map((item) => ({
         stock: item.stock || item.name || "",
@@ -8706,6 +9183,12 @@ function buildClientPersonaApiPayload(analysis, metrics, communication) {
         industry: item.industry_name || item.industry || "",
       })),
       main_risks: (analysis.risks || []).slice(0, 8).map((item) => ({ title: item.title, text: item.text })),
+    },
+    current_market: state.marketSnapshot || {},
+    today_corpus: {
+      date: communication.liveContext?.latestDate || "",
+      highlights: communication.liveContext?.corpusHighlights || [],
+      market_signals: communication.liveContext?.marketParts || [],
     },
     advisor_profile: state.advisorStrategyProfile?.profile || state.advisorStrategyProfile || {},
   };
@@ -8719,12 +9202,12 @@ function buildImmediateClientPersonas(metrics, communication) {
   const commonRisk = `历史收益统计区间为${period}，过往表现不代表未来收益；本服务提供组合建议，交易由客户自主决定。`;
   return [
     {
-      id: "steady_defensive", persona_name: "稳健防守型客户", match_level: (metrics.trailingReturn ?? 0) < 0 ? "谨慎匹配" : "条件匹配",
-      profile_tags: ["先看风险", "重视回撤", "拒绝高压推介"], core_need: "先确认风险边界，再考虑收益空间",
-      communication_angle: "用真实区间、仓位纪律和风险揭示建立信任", avoid_expression: "淡化回撤、只讲收益、暗示保本",
-      match_reason: `组合覆盖${sectors}，需要先核对板块波动是否符合客户承受力。`,
-      full_script: `您更重视本金波动和风险是否可控，我建议先不谈收益预期，先看真实数据：组合主要覆盖${sectors}，${period}可验证收益为${returnText}，交易节奏为${frequency}。我们会同步仓位、调仓理由和风险变化，但不会回避阶段回撤。${commonRisk}\n\n您更希望先看组合的回撤与风控记录，还是当前仓位结构？`,
-      service_focus: ["仓位纪律", "风险预警", "阶段复盘"], priority: 1,
+      id: "balanced_industry_tilt", persona_name: "均衡配置型（压行业）", match_level: metrics.sectors.length ? "高匹配" : "条件匹配",
+      profile_tags: ["均衡底仓", "行业增强", "关注轮动"], core_need: "保持整体均衡，同时在看好的行业上适度增加权重",
+      communication_angle: "先展示全部申万二级行业暴露，再讲重点行业为何值得压权重和何时退出", avoid_expression: "把行业集中说成稳赚，或忽略单一行业回撤风险",
+      match_reason: metrics.sectors.length ? `当前持仓覆盖${sectors}，可以用行业权重、景气和风险边界解释均衡中的重点配置。` : "当前行业映射尚未完成，需等持仓行业补齐后再判断行业倾斜是否合适。",
+      full_script: `如果您希望组合不是平均撒网，而是在整体均衡的基础上对看好的行业适当提高权重，我们会先把${sectors}这些申万二级行业的真实暴露讲清楚，再结合当下行情说明为什么倾斜、关键风险在哪里、什么条件下应该收缩。交易端会同步压力位、支撑位、做T与止损计划，极端风险下也会讲期权期货对冲思路。${commonRisk}\n\n您更希望重点行业的权重偏积极一些，还是先从相对均衡的配置开始？`,
+      service_focus: ["行业权重拆解", "景气与个股逻辑", "压力支撑与退出纪律"], priority: 1,
     },
     {
       id: "balanced_allocation", persona_name: "均衡配置型客户", match_level: "高匹配",
@@ -8813,6 +9296,7 @@ async function requestClientPersonaScripts(analysis, options = {}) {
   clientPersonaAutoAttempted.add(portfolioId);
   if (
     !options.force
+    && state.clientPersonaScriptsByPortfolio[portfolioId]?.schema_version === "client_persona_v2"
     && state.clientPersonaScriptsByPortfolio[portfolioId]?.mode === "deepseek"
     && state.clientPersonaScriptsByPortfolio[portfolioId]?.dimensions?.length
   ) {
@@ -8978,8 +9462,12 @@ function renderTalk(analysis) {
   const communication = buildAdvisorClientCommunication(analysis, metrics);
   const portfolioId = getCurrentPortfolio()?.id || analysis.name;
   const aiResult = state.clientPersonaScriptsByPortfolio[portfolioId] || null;
-  const aiPersonas = aiResult?.personas || [];
+  const allowedPersonaIds = new Set(["balanced_industry_tilt", "balanced_allocation", "growth_aggressive", "busy_low_frequency", "research_participant"]);
+  const aiPersonas = (aiResult?.personas || []).filter((item) => allowedPersonaIds.has(item.id));
   const displayPersonas = aiPersonas.length ? aiPersonas : buildImmediateClientPersonas(metrics, communication);
+  const baseScripts = aiResult?.schema_version === "client_persona_v2" && Array.isArray(aiResult?.base_scenarios) && aiResult.base_scenarios.length
+    ? aiResult.base_scenarios
+    : communication.scripts;
   const aiDimensions = aiResult?.dimensions || [];
   const displayDimensions = aiDimensions.length ? aiDimensions : buildImmediateDimensionScripts(metrics);
   const dimensionScriptCount = displayDimensions.reduce((sum, item) => sum + (item.variants || []).length, 0);
@@ -9001,9 +9489,9 @@ function renderTalk(analysis) {
   const matchScore = String(selectedPersona.match_level || "").includes("高") ? 92
     : String(selectedPersona.match_level || "").includes("条件") ? 76
       : String(selectedPersona.match_level || "").includes("谨慎") ? 52 : 34;
-  const sectorSummary = metrics.sectors.slice(0, 4).map((item) => item.label).join(" · ") || "综合配置";
+  const sectorSummary = metrics.sectors.map((item) => item.label).join(" · ") || "申万二级行业映射暂未完成";
   const container = document.getElementById("view-talk");
-  communication.scripts.forEach((item) => materialCopyMap.set(`persona-${item.id}`, item.text));
+  baseScripts.forEach((item) => materialCopyMap.set(`persona-${item.id}`, item.text));
   displayPersonas.forEach((item) => materialCopyMap.set(`ai-persona-${item.id}`, item.full_script || item.core_pitch || ""));
   if (displayPersonas.length) {
     materialCopyMap.set(
@@ -9024,14 +9512,14 @@ function renderTalk(analysis) {
   );
   materialCopyMap.set(
     "persona-all",
-    communication.scripts.map((item) => `【${item.title}】\n${item.text}`).join("\n\n"),
+    baseScripts.map((item) => `【${item.title}】\n${item.text}`).join("\n\n"),
   );
   materialCopyMap.set("persona-current-stage", stageScript);
   container.innerHTML = `
     <div class="persona-journey-shell">
       <section class="persona-portfolio-strip">
         <div class="persona-portfolio-name"><small>当前组合</small><strong>${escapeHtml(analysis.name)}</strong><span>${escapeHtml(communication.primaryMode)}</span></div>
-        <div class="persona-portfolio-fact"><small>覆盖板块</small><strong>${escapeHtml(sectorSummary)}</strong></div>
+        <div class="persona-portfolio-fact"><small>覆盖板块方向</small><strong>${escapeHtml(sectorSummary)}</strong><span>${escapeHtml(metrics.sectorBasis)}</span></div>
         <div class="persona-portfolio-fact"><small>可验证区间收益</small><strong class="${returnTone}">${returnValue == null ? "—" : pct(returnValue, 2)}</strong><span>${escapeHtml(metrics.returnStart)} 至 ${escapeHtml(metrics.returnEnd)}</span></div>
         <div class="persona-portfolio-fact"><small>交易频次</small><strong>${escapeHtml(metrics.frequencyLabel)}</strong><span>约 ${num(metrics.monthlyFrequency, 1)} 次/月</span></div>
       </section>
@@ -9156,7 +9644,7 @@ function renderTalk(analysis) {
         <button class="pill-btn primary" type="button" data-material-copy="persona-all">复制整套话术</button>
       </div>
       <div class="persona-script-grid">
-        ${communication.scripts.map((item) => `
+        ${baseScripts.map((item) => `
           <article class="persona-client-script">
             <div class="section-title-row">
               <div><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.scene)}</p></div>
@@ -9172,7 +9660,7 @@ function renderTalk(analysis) {
   bindClientPersonaControls(container, analysis);
   if (
     state.activeTab === "talk"
-    && (aiResult?.mode !== "deepseek" || !aiDimensions.length)
+    && (aiResult?.schema_version !== "client_persona_v2" || aiResult?.mode !== "deepseek" || !aiDimensions.length || !aiResult?.base_scenarios?.length)
     && !state.clientPersonaScriptLoading
     && !clientPersonaAutoAttempted.has(portfolioId)
   ) {
@@ -9224,8 +9712,8 @@ function renderPersona(analysis) {
     <section class="persona-key-metrics">
       <article class="persona-key-metric sector">
         <small>组合覆盖板块</small>
-        <strong>${metrics.sectors.length}<em> 个行业板块</em></strong>
-        <div class="persona-key-sector-list">${metrics.sectors.slice(0, 3).map((item) => `<span>${escapeHtml(item.label)}${item.weight == null ? "" : ` ${pct(item.weight, 1)}`}</span>`).join("") || `<span>综合配置</span>`}</div>
+        <strong>${metrics.sectors.length}<em> 个申万二级行业</em></strong>
+        <div class="persona-key-sector-list">${metrics.sectors.map((item) => `<span>${escapeHtml(item.label)}${item.weight == null ? "" : ` ${pct(item.weight, 1)}`}</span>`).join("") || `<span>当前持仓行业映射暂未完成</span>`}</div>
         <p>${escapeHtml(metrics.sectorBasis)}</p>
       </article>
       <article class="persona-key-metric return">
@@ -9244,8 +9732,8 @@ function renderPersona(analysis) {
 
     <section class="persona-sector-coverage">
       <div class="persona-sector-coverage-head">
-        <div><div class="trade-kicker">SECTOR COVERAGE</div><h3>组合覆盖板块</h3><p>按当前持仓市值统计；没有市值时按持仓数量展示，完整列出所有已识别板块。</p></div>
-        <span>${metrics.sectors.length} 个板块 · ${metrics.sectors.reduce((sum, item) => sum + Number(item.count || 0), 0)} 只持仓</span>
+        <div><div class="trade-kicker">SECTOR COVERAGE</div><h3>组合覆盖板块</h3><p>读取当前组合持仓并映射申万二级行业；按持仓市值统计，没有市值时按持仓数量展示。</p></div>
+        <span>${metrics.sectors.length} 个申万二级行业 · ${metrics.holdingCount || 0} 只持仓</span>
       </div>
       <div class="persona-sector-coverage-grid">
         ${metrics.sectors.length ? metrics.sectors.map((item, index) => `
@@ -9254,7 +9742,7 @@ function renderPersona(analysis) {
             <b>${item.weight == null ? `${item.count || 0} 只` : pct(item.weight, 1)}</b>
             <small>${item.weight == null ? "按持仓数量统计" : `${item.count || 0} 只持仓 · 当前市值权重`}</small>
           </article>
-        `).join("") : `<div class="persona-sector-coverage-empty">当前持仓行业尚未识别，系统将使用最近一年交易样本补充板块口径。</div>`}
+        `).join("") : `<div class="persona-sector-coverage-empty">${metrics.holdingCount ? `当前有 ${metrics.holdingCount} 只持仓，申万二级行业映射正在补充，完成后会自动回填。` : "当前暂无持仓数据，暂不能生成组合覆盖行业。"}</div>`}
       </div>
     </section>
 
@@ -9882,6 +10370,158 @@ function renderHoldingStockListCell(row) {
   `;
 }
 
+function holdingSkillInsight(code) {
+  const cleanCode = String(code || "").replace(/\D/g, "").slice(-6);
+  return (state.holdingSkillAnalysis?.items || []).find((item) => String(item.code || "").replace(/\D/g, "").slice(-6) === cleanCode) || null;
+}
+
+function holdingSkillKline(code) {
+  const cleanCode = String(code || "").replace(/\D/g, "").slice(-6);
+  return (state.riskDashboard?.holding_klines?.items || []).find((item) => String(item.code || "").replace(/\D/g, "").slice(-6) === cleanCode) || null;
+}
+
+function holdingSkillPlainText(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*\|?\s*:?-{3,}/.test(line))
+    .map((line) => line
+      .replace(/^\s*#{1,6}\s*/, "")
+      .replace(/\*\*/g, "")
+      .replace(/^\s*\|/, "")
+      .replace(/\|\s*$/, "")
+      .replace(/\s*\|\s*/g, " ｜ ")
+      .trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function holdingSkillLevelCards(insight) {
+  const levels = insight?.levels || {};
+  const configs = [
+    ["support", "支撑位", "support"],
+    ["pressure", "压力位", "pressure"],
+    ["take_profit", "止盈参考", "take-profit"],
+    ["stop_loss", "止损参考", "stop-loss"],
+  ];
+  return `<div class="holding-skill-levels">${configs.map(([key, label, className]) => {
+    const level = levels[key] || {};
+    return `<article class="${className}"><span>${label}</span><strong>${level.value == null ? "—" : `¥${escapeHtml(num(level.value, 2))}`}</strong><small>${escapeHtml(level.text || "等待华泰指标技能返回")}</small></article>`;
+  }).join("")}</div>`;
+}
+
+function holdingSkillNarrative(title, value, placeholder) {
+  const textContent = holdingSkillPlainText(value);
+  return `<section><span>${escapeHtml(title)}</span><p>${escapeHtml(textContent || placeholder)}</p></section>`;
+}
+
+function renderHoldingSkillCards(positions, context = "holding") {
+  const rows = Array.isArray(positions) ? positions : [];
+  const portfolioId = state.currentPortfolioId || "";
+  const loadedForCurrent = state.holdingSkillAnalysisPortfolioId === portfolioId && state.holdingSkillAnalysis;
+  if (state.holdingSkillAnalysisLoading) return `<div class="holding-skill-status loading"><span></span><div><strong>正在调用华泰技能分析当前持仓…</strong><p>同步压力支撑、止盈止损、基本面和交易计划。</p></div></div>`;
+  if (state.holdingSkillAnalysisError) return `<div class="holding-skill-status error"><div><strong>华泰技能分析暂时不可用</strong><p>${escapeHtml(state.holdingSkillAnalysisError)}</p></div><button class="pill-btn secondary" type="button" data-holding-skill-refresh>重新分析</button></div>`;
+  if (!loadedForCurrent) return `<div class="holding-skill-status"><div><strong>等待同步华泰技能数据</strong><p>页面会自动读取当前持仓并生成压力支撑与交易计划。</p></div></div>`;
+  return `<div class="holding-skill-list">${rows.map((position, index) => {
+    const code = position.code || "";
+    const insight = holdingSkillInsight(code);
+    const kline = holdingSkillKline(code);
+    const chartId = `${context === "material" ? "materialHoldingSkillKline" : "holdingSkillKline"}-${index}`;
+    return `<article class="holding-skill-card">
+      <header><div><span>${String(index + 1).padStart(2, "0")}</span><div><h4>${escapeHtml(position.stock || position.name || insight?.stock || code || "当前持仓")}</h4><small>${escapeHtml(code || "代码待补全")} · ${escapeHtml(insight?.industry || position.industry || "行业待识别")} · 仓位 ${position.weight == null || position.weight === "" ? "—" : `${escapeHtml(num(position.weight, 1))}%`}</small></div></div><b>${insight?.analysis_mode === "skills" ? "华泰技能同步" : "本地行情分析"}</b></header>
+      <div class="holding-skill-chart-grid"><div class="holding-skill-chart"><div class="holding-skill-chart-head"><strong>日K · 压力支撑与止损表达</strong><span>${escapeHtml(kline?.latest_date || state.holdingSkillAnalysis?.snapshot_date || "")}</span></div>${(kline?.dates || []).length ? `<div id="${chartId}" class="holding-skill-kline" data-holding-skill-code="${escapeHtml(code)}"></div>` : `<div class="material-trace-placeholder chart">暂无该持仓K线</div>`}</div>${holdingSkillLevelCards(insight)}</div>
+      <div class="holding-skill-narratives">
+        ${holdingSkillNarrative("基本面逻辑", insight?.fundamental_logic, "暂无基本面技能分析")}
+        ${holdingSkillNarrative("基本交易计划", insight?.trading_plan, "暂无基本交易计划")}
+        ${holdingSkillNarrative("止损策略", insight?.stop_loss_strategy, "暂无止损策略")}
+        ${holdingSkillNarrative("为什么选择它作为行业持仓", insight?.industry_selection_reason, "暂无行业代表性说明")}
+      </div>
+    </article>`;
+  }).join("") || `<div class="material-trace-placeholder">当前组合暂无持仓</div>`}</div><div class="holding-skill-source"><span>${state.holdingSkillAnalysis?.source?.fallback ? "外部技能不可用时自动使用本地已核验行情，未补写财务数据" : "压力支撑：query-indicator / queryIndicator"}</span><span>${state.holdingSkillAnalysis?.source?.fallback ? "支撑压力取近20个有效交易日区间，仅作复核参考" : "基本面与策略：financial-analysis / marketInsight"}</span><span>生成于 ${escapeHtml(state.holdingSkillAnalysis?.generated_at || "")}</span><button class="text-action" type="button" data-holding-skill-refresh>刷新技能分析</button></div>`;
+}
+
+function holdingSkillChartOption(kline = {}, insight = {}) {
+  const levels = insight.levels || {};
+  const marks = [
+    [levels.support, "支撑", "#168252", "insideStartTop"],
+    [levels.pressure, "压力", "#c62828", "insideEndTop"],
+    [levels.take_profit, "止盈", "#7c3aed", "insideStartBottom"],
+    [levels.stop_loss, "止损", "#ea580c", "insideEndBottom"],
+  ].filter(([item]) => materialNumber(item?.value) != null).map(([item, label, color, position]) => ({
+    name: label,
+    yAxis: Number(item.value),
+    lineStyle: { color, type: "dashed", width: 1.5 },
+    label: { formatter: `${label} ${num(item.value, 2)}`, color, position, fontSize: 10 },
+  }));
+  return {
+    animation: false,
+    tooltip: { trigger: "axis", axisPointer: { type: "cross" } },
+    legend: { data: ["K线", "MA20", "MA60"], top: 3, right: 8, textStyle: { fontSize: 10 } },
+    grid: [{ left: 52, right: 56, top: 37, height: "61%" }, { left: 52, right: 56, top: "76%", height: "11%" }],
+    xAxis: [{ type: "category", data: kline.dates || [], boundaryGap: true, axisLabel: { color: "#64748b", fontSize: 9 }, axisLine: { lineStyle: { color: "#cbd5e1" } } }, { type: "category", gridIndex: 1, data: kline.dates || [], boundaryGap: true, axisLabel: { show: false }, axisTick: { show: false } }],
+    yAxis: [{ scale: true, axisLabel: { color: "#64748b", fontSize: 9 }, splitLine: { lineStyle: { color: "#e5e7eb", type: "dashed" } } }, { gridIndex: 1, scale: true, axisLabel: { show: false }, splitLine: { show: false } }],
+    dataZoom: [{ type: "inside", xAxisIndex: [0, 1], start: 45, end: 100 }, { type: "slider", xAxisIndex: [0, 1], start: 45, end: 100, bottom: 0, height: 17 }],
+    series: [
+      { name: "K线", type: "candlestick", data: kline.ohlc || [], itemStyle: { color: "#c62828", color0: "#168252", borderColor: "#c62828", borderColor0: "#168252" }, markLine: { symbol: ["none", "none"], silent: true, data: marks } },
+      { name: "MA20", type: "line", data: kline.ma20 || [], showSymbol: false, lineStyle: { width: 1.4, color: "#d97706" } },
+      { name: "MA60", type: "line", data: kline.ma60 || [], showSymbol: false, lineStyle: { width: 1.4, color: "#2563eb" } },
+      { name: "成交量", type: "bar", xAxisIndex: 1, yAxisIndex: 1, data: kline.volumes || [], itemStyle: { color: "#94a3b8" } },
+    ],
+  };
+}
+
+function renderHoldingSkillCharts(context = "holding") {
+  if (typeof echarts === "undefined") return;
+  const prefix = context === "material" ? "materialHoldingSkillKline" : "holdingSkillKline";
+  document.querySelectorAll(`[id^="${prefix}-"]`).forEach((dom) => {
+    const code = dom.dataset.holdingSkillCode || "";
+    const kline = holdingSkillKline(code);
+    const insight = holdingSkillInsight(code);
+    if (!kline || !insight || !(kline.dates || []).length) return;
+    const chart = echarts.getInstanceByDom(dom) || echarts.init(dom);
+    chart.setOption(holdingSkillChartOption(kline, insight), true);
+  });
+}
+
+async function loadHoldingSkillAnalysis(force = false) {
+  const portfolioId = state.currentPortfolioId || "";
+  if (state.holdingSkillAnalysisLoading) return;
+  if (state.holdingSkillAnalysis && state.holdingSkillAnalysisPortfolioId === portfolioId && !force) return;
+  state.holdingSkillAnalysisLoading = true;
+  state.holdingSkillAnalysisError = "";
+  renderAll();
+  try {
+    await loadRiskDashboard(false);
+    await waitForMaterialRiskLoad();
+    const params = new URLSearchParams({ portfolio_id: portfolioId });
+    if (force) params.set("refresh", "1");
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 180000);
+    let response;
+    try {
+      response = await fetch(`/api/holding-analysis/htsc-skills?${params}`, { cache: "no-store", signal: controller.signal });
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+    const payload = await response.json();
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${response.status}`);
+    state.holdingSkillAnalysis = payload;
+    state.holdingSkillAnalysisPortfolioId = portfolioId;
+  } catch (error) {
+    state.holdingSkillAnalysisError = error?.name === "AbortError" ? "技能分析超过3分钟，请稍后重试" : (error.message || String(error));
+  } finally {
+    state.holdingSkillAnalysisLoading = false;
+    renderAll();
+  }
+}
+
+function bindHoldingSkillControls(scope = document) {
+  scope.querySelectorAll("[data-holding-skill-refresh]").forEach((button) => {
+    if (button.dataset.bound === "true") return;
+    button.dataset.bound = "true";
+    button.addEventListener("click", () => loadHoldingSkillAnalysis(true));
+  });
+}
+
 function renderSimpleHoldingMatrix() {
   const dates = getHoldingDisplayDates();
   const { lookup, previousByDate, ascending } = buildHoldingTimelineLookup();
@@ -9984,6 +10624,10 @@ function renderSimpleHoldingMatrix() {
             `).join("") : ""}
           </tbody>
         </table>
+      </div>
+      <div class="holding-skill-block">
+        <div class="holding-skill-block-head"><div><span>华泰技能 · 当前持仓</span><h3>个股K线、压力支撑与基本交易计划</h3><p>每只持仓名称下直接展示日K，并标注压力、支撑、止盈与止损参考位。</p></div></div>
+        ${renderHoldingSkillCards(getCurrentHoldingRows(), "holding")}
       </div>
     </div>
   `;
@@ -10186,6 +10830,83 @@ function renderHoldingAssistantPreview() {
     </div>`;
 }
 
+function adjustmentReasonPlanRows(item) {
+  const rows = Array.isArray(item?.daily_trade_plan) ? item.daily_trade_plan : [];
+  return rows.map((row, index) => {
+    if (typeof row === "string") return { phase: `计划 ${index + 1}`, plan: row };
+    return {
+      phase: cleanText(row?.phase || row?.day || `计划 ${index + 1}`),
+      plan: cleanText(row?.plan || row?.action || row?.content || "")
+    };
+  }).filter((row) => row.plan);
+}
+
+function formatAdjustmentReasonForCopy(result) {
+  const items = Array.isArray(result?.items) ? result.items : [];
+  const blocks = items.map((item, index) => {
+    const plans = adjustmentReasonPlanRows(item);
+    const risks = Array.isArray(item.invalidation_conditions) ? item.invalidation_conditions : [];
+    return [
+      `${index + 1}. ${item.stock || "本次调仓"}${item.code ? `（${item.code}）` : ""}｜${item.action || "调仓"}`,
+      `预计持有：${item.expected_holding_days || "待结合交易计划确认"}`,
+      `调仓理由：${item.action_reason || "—"}`,
+      `基本面逻辑：${item.fundamental_logic || "—"}`,
+      `技术面逻辑：${item.technical_logic || "—"}`,
+      "每日交易计划：",
+      ...(plans.length ? plans.map((row) => `- ${row.phase}：${row.plan}`) : ["- 暂无"]),
+      ...(risks.length ? ["失效条件：", ...risks.map((risk) => `- ${risk}`)] : [])
+    ].join("\n");
+  });
+  return [result?.summary || "调仓理由", ...blocks].filter(Boolean).join("\n\n");
+}
+
+function renderAdjustmentReasonResult(result) {
+  if (!result) {
+    return `<div class="adjustment-reason-empty">输入今天准备执行的买入、加仓、减仓或清仓计划，系统会结合最近金山语料与真实行情生成固定格式的调仓理由。</div>`;
+  }
+  const items = Array.isArray(result.items) ? result.items : [];
+  const source = result.source_summary || {};
+  return `
+    <div class="adjustment-reason-result-head">
+      <div><strong>${escapeHtml(result.summary || "调仓理由已生成")}</strong><span>${escapeHtml(result.mode === "llm" ? "DeepSeek 生成" : "本地规则生成")} · ${escapeHtml(result.generated_at || "")}</span></div>
+      <button class="pill-btn secondary" id="copyAdjustmentReasonBtn" type="button">复制全部理由</button>
+    </div>
+    <div class="adjustment-reason-source">本次参考：最近金山语料 ${Number(source.advisor_doc_count || 0)} 条${source.latest_advisor_date ? `（更新至 ${escapeHtml(source.latest_advisor_date)}）` : ""} · 技术行情 ${Number(source.technical_symbol_count || 0)} 只</div>
+    <div class="adjustment-reason-list">
+      ${items.map((item, index) => {
+        const plans = adjustmentReasonPlanRows(item);
+        const risks = Array.isArray(item.invalidation_conditions) ? item.invalidation_conditions : [];
+        return `<article class="adjustment-reason-item">
+          <div class="adjustment-reason-item-head"><div><span>${index + 1}</span><strong>${escapeHtml(item.stock || "本次调仓")}</strong><small>${escapeHtml(item.code || "未提供代码")}</small></div><b>${escapeHtml(item.action || "调仓")}</b></div>
+          <div class="adjustment-reason-holding"><span>预计持有</span><strong>${escapeHtml(item.expected_holding_days || "待确认")}</strong></div>
+          <div class="adjustment-reason-grid">
+            <div><span>调仓理由</span><p>${escapeHtml(item.action_reason || "—")}</p></div>
+            <div><span>基本面逻辑</span><p>${escapeHtml(item.fundamental_logic || "—")}</p></div>
+            <div><span>技术面逻辑</span><p>${escapeHtml(item.technical_logic || "—")}</p></div>
+          </div>
+          <div class="adjustment-plan"><strong>每日个股交易计划</strong>${plans.map((row) => `<div><span>${escapeHtml(row.phase)}</span><p>${escapeHtml(row.plan)}</p></div>`).join("") || `<p>暂无可执行计划。</p>`}</div>
+          ${risks.length ? `<div class="adjustment-risks"><strong>失效条件 / 风险边界</strong>${risks.map((risk) => `<span>• ${escapeHtml(risk)}</span>`).join("")}</div>` : ""}
+        </article>`;
+      }).join("") || `<div class="adjustment-reason-empty">没有生成可展示的标的，请补充证券名称、代码和交易方向。</div>`}
+    </div>
+    ${(result.warnings || []).length ? `<div class="holding-warning-box">${result.warnings.map((item) => `<div>• ${escapeHtml(item)}</div>`).join("")}</div>` : ""}`;
+}
+
+function renderAdjustmentReasonWorkbench() {
+  const current = getCurrentPortfolio();
+  const portfolioId = current?.id || "__default__";
+  const draft = state.adjustmentReasonDraftByPortfolio[portfolioId] || "";
+  const status = state.adjustmentReasonStatusByPortfolio[portfolioId] || "只生成理由与计划，不会自动修改持仓；结果可一键复制。";
+  const result = state.adjustmentReasonResultByPortfolio[portfolioId] || null;
+  return `<section class="panel-card adjustment-reason-card">
+    <div class="trade-panel-title"><div><span class="trade-kicker deepseek">AI 调仓理由工作台</span><h3>语料驱动调仓理由</h3><p>结合最近金山文档语料、当前组合与个股技术行情，生成可直接使用的固定格式理由。</p></div><span class="assistant-safe-badge">生成理由 · 不改持仓</span></div>
+    <textarea id="adjustmentReasonText" class="holding-assistant-text adjustment-reason-text" placeholder="粘贴今天准备执行的交易，例如：&#10;今天计划加仓北方华创 002371，仓位从10%提高到15%；&#10;西部矿业 601168 冲高减仓5%，如果跌破近期支撑则继续降低仓位。">${escapeHtml(draft)}</textarea>
+    <div class="assistant-controls adjustment-reason-controls"><span>输出：预计持有天数 / 调仓理由 / 基本面逻辑 / 技术面逻辑 / 每日交易计划</span><div><button class="pill-btn secondary" id="useHoldingAssistantDraftBtn" type="button">带入上方交易描述</button><button class="pill-btn primary" id="generateAdjustmentReasonBtn" type="button">生成调仓理由</button></div></div>
+    <div class="trade-status assistant">${escapeHtml(status)}</div>
+    ${renderAdjustmentReasonResult(result)}
+  </section>`;
+}
+
 function renderHoldingTradingWorkbench() {
   const current = getCurrentPortfolio();
   const holdings = getCurrentHoldingRows();
@@ -10218,7 +10939,9 @@ function renderHoldingTradingWorkbench() {
         <div class="trade-status assistant">${escapeHtml(state.holdingAssistantStatus || "支持调仓、完整持仓、任意历史日期修正和清空全部持仓记录。")}</div>
         ${renderHoldingAssistantPreview()}
       </section>
-    </div>`;
+    </div>
+    <div style="height:14px;"></div>
+    ${renderAdjustmentReasonWorkbench()}`;
 }
 
 function renderHoldingImportPanel() {
@@ -10245,13 +10968,20 @@ function renderHoldingImportPanel() {
 }
 
 function renderStyle(analysis) {
-  document.getElementById("view-style").innerHTML = `
+  const container = document.getElementById("view-style");
+  container.innerHTML = `
     ${renderHoldingImportPanel()}
     <div style="height:14px;"></div>
     ${renderHoldingTradingWorkbench()}
     <div style="height:14px;"></div>
     ${renderSimpleHoldingMatrix()}
   `;
+  bindHoldingSkillControls(container);
+  if (state.activeTab === "style") {
+    const needsSkillLoad = !state.holdingSkillAnalysis || state.holdingSkillAnalysisPortfolioId !== (state.currentPortfolioId || "");
+    if (needsSkillLoad && !state.holdingSkillAnalysisLoading) window.setTimeout(() => loadHoldingSkillAnalysis(), 0);
+    else window.setTimeout(() => renderHoldingSkillCharts("holding"), 0);
+  }
 }
 
 function renderAll() {
@@ -10563,6 +11293,82 @@ function bindOverviewControls(scope = document) {
         actionStatusEl.textContent = state.holdingAssistantStatus;
         renderAll();
       }
+    });
+  }
+  const adjustmentReasonText = scope.querySelector("#adjustmentReasonText");
+  if (adjustmentReasonText && adjustmentReasonText.dataset.bound !== "true") {
+    adjustmentReasonText.dataset.bound = "true";
+    adjustmentReasonText.addEventListener("input", () => {
+      const portfolioId = getCurrentPortfolio()?.id || "__default__";
+      state.adjustmentReasonDraftByPortfolio[portfolioId] = adjustmentReasonText.value;
+    });
+  }
+  const useHoldingAssistantDraftBtn = scope.querySelector("#useHoldingAssistantDraftBtn");
+  if (useHoldingAssistantDraftBtn && useHoldingAssistantDraftBtn.dataset.bound !== "true") {
+    useHoldingAssistantDraftBtn.dataset.bound = "true";
+    useHoldingAssistantDraftBtn.addEventListener("click", () => {
+      const portfolioId = getCurrentPortfolio()?.id || "__default__";
+      const sourceText = cleanText(state.holdingAssistantDraft || document.getElementById("holdingAssistantText")?.value || "");
+      if (!sourceText) {
+        state.adjustmentReasonStatusByPortfolio[portfolioId] = "上方还没有交易描述，请直接在这里输入今天的调仓计划。";
+      } else {
+        state.adjustmentReasonDraftByPortfolio[portfolioId] = sourceText;
+        state.adjustmentReasonStatusByPortfolio[portfolioId] = "已带入上方交易描述，可以继续补充你的判断后生成。";
+      }
+      persistState();
+      renderAll();
+    });
+  }
+  const generateAdjustmentReasonBtn = scope.querySelector("#generateAdjustmentReasonBtn");
+  if (generateAdjustmentReasonBtn && generateAdjustmentReasonBtn.dataset.bound !== "true") {
+    generateAdjustmentReasonBtn.dataset.bound = "true";
+    generateAdjustmentReasonBtn.addEventListener("click", async () => {
+      const current = getCurrentPortfolio();
+      const portfolioId = current?.id || "__default__";
+      const inputText = cleanText(document.getElementById("adjustmentReasonText")?.value || "");
+      if (!inputText) {
+        state.adjustmentReasonStatusByPortfolio[portfolioId] = "请先输入今天准备执行的交易或调仓计划。";
+        renderAll();
+        return;
+      }
+      state.adjustmentReasonDraftByPortfolio[portfolioId] = inputText;
+      state.adjustmentReasonStatusByPortfolio[portfolioId] = "正在读取最近金山语料、持仓与技术行情并生成理由…";
+      generateAdjustmentReasonBtn.disabled = true;
+      generateAdjustmentReasonBtn.textContent = "生成中…";
+      const statusEl = scope.querySelector(".adjustment-reason-card .trade-status");
+      if (statusEl) statusEl.textContent = state.adjustmentReasonStatusByPortfolio[portfolioId];
+      try {
+        const result = await postJson("/api/adjustment-reason/generate", {
+          portfolio_id: current?.id || "",
+          portfolio_name: current?.name || "",
+          trade_text: inputText,
+          current_positions: current?.dataset?.open_positions || [],
+          selected_holding_date: state.selectedHoldingDate || "",
+        });
+        state.adjustmentReasonResultByPortfolio[portfolioId] = result;
+        state.adjustmentReasonStatusByPortfolio[portfolioId] = `已生成 ${result.items?.length || 0} 只标的的调仓理由，可直接复制使用。`;
+        persistState();
+        renderAll();
+      } catch (error) {
+        state.adjustmentReasonStatusByPortfolio[portfolioId] = `生成失败：${error.message}`;
+        renderAll();
+      }
+    });
+  }
+  const copyAdjustmentReasonBtn = scope.querySelector("#copyAdjustmentReasonBtn");
+  if (copyAdjustmentReasonBtn && copyAdjustmentReasonBtn.dataset.bound !== "true") {
+    copyAdjustmentReasonBtn.dataset.bound = "true";
+    copyAdjustmentReasonBtn.addEventListener("click", async () => {
+      const portfolioId = getCurrentPortfolio()?.id || "__default__";
+      const result = state.adjustmentReasonResultByPortfolio[portfolioId];
+      if (!result) return;
+      try {
+        await navigator.clipboard.writeText(formatAdjustmentReasonForCopy(result));
+        state.adjustmentReasonStatusByPortfolio[portfolioId] = "调仓理由已复制到剪贴板。";
+      } catch (error) {
+        state.adjustmentReasonStatusByPortfolio[portfolioId] = "复制失败，请手动选择结果文本。";
+      }
+      renderAll();
     });
   }
 }
