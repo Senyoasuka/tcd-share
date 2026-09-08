@@ -8603,9 +8603,11 @@ async function loadMaterialFrontData(analysis, force = false) {
       if (state.materialSectorDetails[code] && !force) return [code, state.materialSectorDetails[code]];
       const params = new URLSearchParams({ industry_code: code });
       if (force) params.set("refresh", "1");
-      const response = await fetch(`/api/v1/risk/sector-detail?${params}`, { cache: "no-store" });
-      const detail = await response.json();
-      if (!response.ok || detail.ok === false) return [code, { ok: false, error: detail.error || `HTTP ${response.status}` }];
+      const detail = await fetchApiWithStaticFallback(
+        `/api/v1/risk/sector-detail?${params}`,
+        `${STATIC_RISK_ROOT}/sectors/${encodeURIComponent(code)}.json`,
+        `行业 ${code}`
+      );
       return [code, detail];
     }));
     state.materialSectorDetails = { ...state.materialSectorDetails, ...Object.fromEntries(detailRows) };
@@ -10380,6 +10382,63 @@ function holdingSkillKline(code) {
   return (state.riskDashboard?.holding_klines?.items || []).find((item) => String(item.code || "").replace(/\D/g, "").slice(-6) === cleanCode) || null;
 }
 
+function buildStaticHoldingSkillAnalysis() {
+  const positions = getCurrentHoldingRows();
+  const klineRows = state.riskDashboard?.holding_klines?.items || [];
+  const klineByCode = new Map(klineRows.map((item) => [String(item.code || "").replace(/\D/g, "").slice(-6), item]));
+  const level = (label, value, textContent) => ({ label, value: Number.isFinite(value) ? Number(value.toFixed(3)) : null, text: Number.isFinite(value) ? textContent : "静态快照数据不足，暂不估算" });
+  const items = positions.map((position) => {
+    const code = String(position.code || "").replace(/\D/g, "").slice(-6);
+    const kline = klineByCode.get(code) || {};
+    const recent = (kline.ohlc || []).slice(-20).filter((row) => Array.isArray(row) && row.length >= 4);
+    const lows = recent.map((row) => Number(row[2])).filter(Number.isFinite);
+    const highs = recent.map((row) => Number(row[3])).filter(Number.isFinite);
+    const support = lows.length ? Math.min(...lows) : NaN;
+    const pressure = highs.length ? Math.max(...highs) : NaN;
+    const latest = Number(kline.latest_price);
+    const ma20 = Number((kline.ma20 || []).at(-1));
+    const trend = Number.isFinite(latest) && Number.isFinite(ma20)
+      ? (latest >= ma20 ? "最新价位于MA20上方" : "最新价位于MA20下方")
+      : "均线数据不足";
+    const industry = position.industry || kline.industry || "";
+    return {
+      stock: position.stock || position.name || kline.stock || code,
+      code,
+      industry,
+      weight: position.weight,
+      levels: {
+        pressure: level("压力位", pressure, "近20个有效交易日最高价，仅作观察参考"),
+        support: level("支撑位", support, "近20个有效交易日最低价，仅作观察参考"),
+        take_profit: level("止盈参考位", pressure, "以近20日压力位作为复核参考，不代表收益承诺"),
+        stop_loss: level("止损参考位", support, "以近20日支撑位作为风险复核参考，不代替人工决策"),
+      },
+      indicator_text: `${kline.latest_date ? `数据日期：${kline.latest_date}；` : ""}${Number.isFinite(latest) ? `最新价：${num(latest, 2)}元；` : ""}${trend}。`,
+      fundamental_logic: industry
+        ? `静态组合快照将该标的归入${industry}；云端未连接财务分析技能，因此不补写未经核验的业绩、估值或产业结论。`
+        : "云端静态快照没有足够的行业和财务证据，不补写未经核验的基本面结论。",
+      trading_plan: Number.isFinite(latest)
+        ? `以快照最新价${num(latest, 2)}元和${trend}为观察基准；接近压力位时复核量能，回落至支撑位附近时检查承接。`
+        : "先补齐最新行情；价格、量能和关键位置未核验前，不根据空白数据执行交易。",
+      stop_loss_strategy: Number.isFinite(support)
+        ? `将${num(support, 2)}元近20日低位区作为风险复核线；有效跌破后重新评估持仓逻辑和仓位。`
+        : "静态历史不足以计算20日支撑，暂不生成价格止损位。",
+      industry_selection_reason: industry
+        ? `该标的是当前组合中已归类到${industry}的持仓；行业代表性仍需结合财务与行业数据人工核验。`
+        : "静态快照缺少足够行业证据，暂不能判断行业代表性。",
+      analysis_mode: "static_verified_market",
+    };
+  });
+  return {
+    ok: true,
+    portfolio_id: state.currentPortfolioId || "",
+    portfolio_name: getCurrentPortfolio()?.name || "",
+    snapshot_date: state.riskDashboard?.holding_klines?.snapshot_date || state.riskDashboard?.risk_v2?.as_of_date || "",
+    generated_at: state.riskDashboard?.holding_klines?.fetched_at || state.riskDashboard?.risk_v2?.calculation_time || "",
+    items,
+    source: { fallback: "static_verified_market", indicator_error: "云端静态页不连接本机技能", analysis_error: "云端静态页不连接本机技能" },
+  };
+}
+
 function holdingSkillPlainText(value) {
   return String(value || "")
     .split(/\r?\n/)
@@ -10491,6 +10550,13 @@ async function loadHoldingSkillAnalysis(force = false) {
   renderAll();
   try {
     await loadRiskDashboard(false);
+    if (!isLocalServiceHost()) {
+      const staticPayload = buildStaticHoldingSkillAnalysis();
+      if (!(staticPayload.items || []).length) throw new Error("云端静态快照中暂无可分析持仓");
+      state.holdingSkillAnalysis = staticPayload;
+      state.holdingSkillAnalysisPortfolioId = portfolioId;
+      return;
+    }
     await waitForMaterialRiskLoad();
     const params = new URLSearchParams({ portfolio_id: portfolioId });
     if (force) params.set("refresh", "1");
@@ -10512,6 +10578,53 @@ async function loadHoldingSkillAnalysis(force = false) {
     state.holdingSkillAnalysisLoading = false;
     renderAll();
   }
+}
+
+function buildStaticAdjustmentReason(inputText, current) {
+  const textContent = String(inputText || "");
+  const action = textContent.includes("清仓") ? "清仓" : textContent.includes("减仓") || textContent.includes("卖出") ? "减仓" : textContent.includes("加仓") ? "加仓" : textContent.includes("买入") ? "买入" : "调仓";
+  const codes = [...new Set(textContent.match(/(?<!\d)\d{6}(?!\d)/g) || [])];
+  const holdings = getCurrentHoldingRows();
+  let targets = holdings.filter((item) => codes.includes(String(item.code || "")) || (item.stock && textContent.includes(item.stock)));
+  if (!targets.length && codes.length) targets = codes.map((code) => ({ code, stock: code }));
+  if (!targets.length) targets = [{ code: "", stock: "本次调仓" }];
+  const klineMap = new Map((state.riskDashboard?.holding_klines?.items || []).map((item) => [String(item.code || ""), item]));
+  const items = targets.map((target) => {
+    const kline = klineMap.get(String(target.code || "")) || {};
+    const recent = (kline.ohlc || []).slice(-20).filter((row) => Array.isArray(row) && row.length >= 4);
+    const lows = recent.map((row) => Number(row[2])).filter(Number.isFinite);
+    const highs = recent.map((row) => Number(row[3])).filter(Number.isFinite);
+    const support = lows.length ? Math.min(...lows) : null;
+    const pressure = highs.length ? Math.max(...highs) : null;
+    const latest = Number(kline.latest_price);
+    const technical = Number.isFinite(latest)
+      ? `截至${kline.latest_date || "静态快照日"}，最新价${num(latest, 2)}元${support != null && pressure != null ? `，近20日支撑/压力约${num(support, 2)}/${num(pressure, 2)}元` : ""}。`
+      : "云端静态快照中暂无该标的足够行情，不估算技术位置。";
+    return {
+      stock: target.stock || target.name || target.code || "本次调仓",
+      code: target.code || "",
+      action,
+      expected_holding_days: action === "减仓" || action === "清仓" ? "1–3个交易日" : "3–5个交易日",
+      action_reason: `根据输入计划执行${action}；原始计划：${textContent.slice(0, 260)}`,
+      fundamental_logic: "云端静态页未连接本机主理人语料和财务分析接口，基本面逻辑需要回到本地完整观察台补充核验。",
+      technical_logic: technical,
+      daily_trade_plan: [
+        { phase: "执行当日", plan: "按预定仓位分批执行，不在明显偏离计划价时追价。" },
+        { phase: "次日复核", plan: "检查价格、量能、板块共振和关键位置承接。" },
+        { phase: "后续持有期", plan: "每日复核原逻辑；跌破支撑或逻辑证伪时重新评估仓位。" },
+      ],
+      invalidation_conditions: ["价格跌破已核验支撑且无法修复", "原交易逻辑被后续信息证伪", "实际仓位偏离风险预算"],
+      confidence: Number.isFinite(latest) ? 0.45 : 0.25,
+    };
+  });
+  return {
+    summary: `已按云端静态规则整理 ${items.length} 只标的的调仓计划`,
+    items,
+    mode: "browser_static_rules",
+    warnings: ["云端页面不连接本机语料和模型；请在本地完整观察台生成并核验正式调仓理由。"],
+    generated_at: new Date().toISOString(),
+    source_summary: { advisor_doc_count: 0, technical_symbol_count: items.filter((item) => item.technical_logic.includes("最新价")).length, portfolio_position_count: holdings.length },
+  };
 }
 
 function bindHoldingSkillControls(scope = document) {
@@ -11350,7 +11463,14 @@ function bindOverviewControls(scope = document) {
         persistState();
         renderAll();
       } catch (error) {
-        state.adjustmentReasonStatusByPortfolio[portfolioId] = `生成失败：${error.message}`;
+        if (!isLocalServiceHost()) {
+          const result = buildStaticAdjustmentReason(inputText, current);
+          state.adjustmentReasonResultByPortfolio[portfolioId] = result;
+          state.adjustmentReasonStatusByPortfolio[portfolioId] = `云端已按静态行情整理 ${result.items?.length || 0} 只标的；正式理由请回本地完整观察台复核。`;
+          persistState();
+        } else {
+          state.adjustmentReasonStatusByPortfolio[portfolioId] = `生成失败：${error.message}`;
+        }
         renderAll();
       }
     });
