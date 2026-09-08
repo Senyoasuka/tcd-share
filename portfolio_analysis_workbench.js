@@ -8341,6 +8341,20 @@ function renderMaterialImagePanel(analysis, scripts) {
 async function refreshMaterialSourceSummary(dateValue) {
   const targetDate = normalizeDateInput(dateValue || state.selectedMaterialDate || formatDateObject(new Date()));
   if (!targetDate) return null;
+  const browserStaticSummary = () => ({
+    requested_date: targetDate,
+    advisor_requested_date: targetDate,
+    advisor_used_date: targetDate,
+    advisor_count: (state.feedRecords || []).filter((item) => normalizeDateInput(item.date) === targetDate).length,
+    hotspot_count: (state.hotRecords || []).filter((item) => normalizeDateInput(item.date) === targetDate).length,
+    advisor_fallback: false,
+    source_mode: "browser_static_snapshot",
+  });
+  if (!isLocalServiceHost()) {
+    state.materialSourceSummary = browserStaticSummary();
+    persistState();
+    return state.materialSourceSummary;
+  }
   try {
     const response = await fetch(`/api/material/source?date=${encodeURIComponent(targetDate)}`, { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -8353,7 +8367,9 @@ async function refreshMaterialSourceSummary(dateValue) {
     return state.materialSourceSummary;
   } catch (error) {
     console.warn("material source summary failed", error);
-    return null;
+    state.materialSourceSummary = browserStaticSummary();
+    persistState();
+    return state.materialSourceSummary;
   }
 }
 
