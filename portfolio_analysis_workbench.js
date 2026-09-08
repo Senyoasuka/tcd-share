@@ -750,7 +750,11 @@ function getRecentHotRecords(limit = 30) {
 }
 
 async function postJson(url, payload) {
-  const response = await fetch(url, {
+  const cloudDeepseekPath = /^\/api\/client-persona\//.test(url);
+  const requestUrl = cloudDeepseekPath && !isLocalServiceHost()
+    ? `https://www.tianchend.online${url}`
+    : url;
+  const response = await fetch(requestUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
