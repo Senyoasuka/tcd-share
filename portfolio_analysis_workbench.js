@@ -187,21 +187,9 @@ async function fetchApiWithStaticFallback(apiUrl, staticUrl, label) {
   // avoids a wasted HTML/405 response before every risk request and makes the
   // risk tab usable on slower mobile connections.
   if (!isLocalServiceHost()) {
-    let staticError = null;
-    try {
-      const response = await fetch(staticUrl, { cache: "no-store" });
-      const payload = await readJsonResponse(response, `${label}静态快照`);
-      payload.__static_snapshot = true;
-      return payload;
-    } catch (error) {
-      staticError = error;
-    }
-    try {
-      const response = await fetch(apiUrl, { cache: "no-store" });
-      return await readJsonResponse(response, label);
-    } catch (_) {
-      throw staticError;
-    }
+    const embedded = readEmbeddedCloudSnapshot(staticUrl);
+    if (embedded) return { ...embedded, __static_snapshot: true };
+    return { ...await fetchStaticSnapshot(staticUrl, label), __static_snapshot: true };
   }
   let apiError = null;
   try {
@@ -217,6 +205,32 @@ async function fetchApiWithStaticFallback(apiUrl, staticUrl, label) {
     return payload;
   } catch (staticError) {
     throw apiError || staticError;
+  }
+}
+
+function readEmbeddedCloudSnapshot(url) {
+  const key = String(url).replace(/^\.\//, "").split("?")[0];
+  try {
+    const node = document.getElementById("cloudWorkbenchSnapshot");
+    if (!node) return null;
+    const snapshots = window.__cloudWorkbenchSnapshot || (window.__cloudWorkbenchSnapshot = JSON.parse(node.textContent));
+    return snapshots[key] || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function fetchStaticSnapshot(url, label) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(url, { cache: "no-store", signal: controller.signal });
+    return await readJsonResponse(response, `${label}静态快照`);
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error(`${label}快照读取超时，请检查网络后重试`);
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
   }
 }
 
@@ -445,9 +459,8 @@ function hydrateStateFromStorage() {
 async function hydratePortfoliosFromStaticSeed() {
   if (window.location.protocol === "file:") return false;
   try {
-    const response = await fetch("./static_data_seed.json", { cache: "no-store" });
-    if (!response.ok) return false;
-    const payload = await response.json();
+    const payload = (!isLocalServiceHost() && readEmbeddedCloudSnapshot("./static_data_seed.json"))
+      || await fetchStaticSnapshot("./static_data_seed.json", "初始持仓");
     const seeded = (payload.portfolios || []).map(buildPortfolioRecordFromSaved).filter(Boolean);
     if (!seeded.length) return false;
     const seedGeneratedAt = String(payload.generated_at || payload.source_updated_at || "");
@@ -5397,7 +5410,7 @@ async function loadRiskDashboard(force = false) {
     replaced = true;
   } catch (error) {
     state.riskDashboardError = error?.name === "AbortError"
-      ? "风控计算超过 45 秒，请稍后点击刷新重试"
+      ? (isLocalServiceHost() ? "风控服务响应超时，请重试" : "风控快照读取中断，请重试")
       : (error.message || String(error));
   } finally {
     state.riskDashboardLoading = false;
@@ -5482,8 +5495,10 @@ async function loadRiskSectorDetail(industryCode, force = false) {
 async function loadRiskAnnotations(scope, code) {
   const key = riskChartKey(scope, code);
   if (!code || Object.prototype.hasOwnProperty.call(state.riskAnnotationCache, key)) return;
-  if (!isLocalServiceHost() && Array.isArray(state.riskAnnotationDrafts[key])) {
-    state.riskAnnotationCache[key] = state.riskAnnotationDrafts[key];
+  if (!isLocalServiceHost()) {
+    const annotations = Array.isArray(state.riskAnnotationDrafts[key]) ? state.riskAnnotationDrafts[key] : [];
+    state.riskAnnotationCache[key] = annotations;
+    state.riskAnnotationDrafts[key] = annotations;
     return;
   }
   state.riskAnnotationCache[key] = null;
@@ -6161,8 +6176,10 @@ function renderRiskDashboard() {
       <div class="panel-card">
         <h3>风控体系暂不可用</h3>
         <div class="empty-state">接口返回异常：${escapeHtml(state.riskDashboardError)}</div>
+        <button class="pill-btn secondary" id="retryRiskDashboardBtn" type="button">重新加载风控</button>
       </div>
     `;
+    container.querySelector("#retryRiskDashboardBtn")?.addEventListener("click", () => loadRiskDashboard(true));
     return;
   }
   if (!payload) return;
@@ -7309,7 +7326,7 @@ function renderRiskV2Dashboard(container, payload) {
     <div class="risk-page-shell risk-workspace-shell">
       <header class="risk-page-header">
         <div><h2>风控体系</h2><p>指数与行业技术观察、弱势持仓处理、重大事件分流。</p></div>
-        <div class="risk-page-header-actions"><div><span>${escapeHtml(updatedAt)}</span><strong id="riskRefreshStatus" class="risk-page-data-status ${loading ? "refreshing" : state.riskWorkspaceError ? "error" : "ready"}">${loading ? "数据刷新中" : state.riskWorkspaceError ? escapeHtml(state.riskWorkspaceError) : isStaticSnapshot ? "当天静态风控快照" : "真实行情已更新"}</strong></div><button id="refreshRiskDashboardBtn" type="button" ${loading ? "disabled" : ""}>${loading ? "正在刷新" : isStaticSnapshot ? "重新读取快照" : "刷新数据"}</button></div>
+        <div class="risk-page-header-actions"><div><span>${escapeHtml(updatedAt)}</span><strong id="riskRefreshStatus" class="risk-page-data-status ${loading ? "refreshing" : state.riskWorkspaceError ? "error" : "ready"}">${loading ? "数据刷新中" : state.riskWorkspaceError ? escapeHtml(state.riskWorkspaceError) : isStaticSnapshot ? "已发布风控快照" : "真实行情已更新"}</strong></div><button id="refreshRiskDashboardBtn" type="button" ${loading ? "disabled" : ""}>${loading ? "正在刷新" : isStaticSnapshot ? "重新读取快照" : "刷新数据"}</button></div>
       </header>
 
       ${renderRiskPositionJournal(payload, market)}
@@ -12549,6 +12566,15 @@ async function initializeWorkbench() {
   hydrateStateFromStorage();
   if (requestedTab && tabs.some((item) => item.id === requestedTab && !item.href)) {
     state.activeTab = requestedTab;
+  }
+  if (!isLocalServiceHost() && window.location.protocol !== "file:") {
+    const restored = await hydratePortfoliosFromStaticSeed();
+    if (!restored) renderAll();
+    if (connectionStatusEl) {
+      connectionStatusEl.className = "online";
+      connectionStatusEl.textContent = "云端快照版：数据时间以各模块标注为准；修改保存在当前浏览器。";
+    }
+    return;
   }
   await refreshConnectionStatus();
   const restoredFromDb = await hydratePortfoliosFromDb();
