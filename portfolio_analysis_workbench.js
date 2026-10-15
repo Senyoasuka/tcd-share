@@ -183,6 +183,26 @@ async function readJsonResponse(response, label = "数据") {
 }
 
 async function fetchApiWithStaticFallback(apiUrl, staticUrl, label) {
+  // The public build has no Python API. Reading the published snapshot first
+  // avoids a wasted HTML/405 response before every risk request and makes the
+  // risk tab usable on slower mobile connections.
+  if (!isLocalServiceHost()) {
+    let staticError = null;
+    try {
+      const response = await fetch(staticUrl, { cache: "no-store" });
+      const payload = await readJsonResponse(response, `${label}静态快照`);
+      payload.__static_snapshot = true;
+      return payload;
+    } catch (error) {
+      staticError = error;
+    }
+    try {
+      const response = await fetch(apiUrl, { cache: "no-store" });
+      return await readJsonResponse(response, label);
+    } catch (_) {
+      throw staticError;
+    }
+  }
   let apiError = null;
   try {
     const response = await fetch(apiUrl, { cache: "no-store" });
